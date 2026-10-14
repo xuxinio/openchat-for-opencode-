@@ -59,7 +59,7 @@ Comprobá que anda: `opencode --version`.
 
 ```bash
 cd ~
-git clone https://github.com/<usuario>/opencode-chat.git
+git clone https://github.com/deltree1975-hub/opencode-chat.git
 cd opencode-chat
 ```
 
