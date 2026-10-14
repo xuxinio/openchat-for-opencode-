@@ -147,7 +147,7 @@ def setup_wizard():
     ask("Carpeta raíz", "root", cfg["root"])
     if not cfg["token"] or input("¿Generar un token nuevo? [n]: ").strip().lower() in ("s", "si", "sí", "y"):
         cfg["token"] = secrets.token_urlsafe(24)
-        print(f"🔑 Token: {cfg['token']}   (guardalo: lo pide la web la primera vez)")
+        print("🔑 Token nuevo generado: al arrancar se muestra el enlace que ya lo trae.")
     print("Avisos por ntfy (opcional): el nombre del tema (ej. mi-tema-largo-y-secreto) o la URL completa.")
     print("   Enter = dejarlo como está, '-' = sin avisos.")
     while True:
@@ -163,7 +163,8 @@ def setup_wizard():
     validate(cfg)
     cfg["bienvenida"] = True
     save_config(cfg)
-    print(f"\n✅ Guardado en {CONF_FILE}. Arrancá con: python3 {Path(sys.argv[0]).name}")
+    print(f"\n✅ Guardado en {CONF_FILE}. Arrancá con: python3 {Path(sys.argv[0]).name}"
+          "\n   (al arrancar muestra el enlace que ya entra con el token)")
 
 
 def port_free(host, port):
@@ -191,6 +192,11 @@ def auto_config():
           + f" · puerto {cfg['port']} · carpeta {cfg['root']}")
     print("   Lo demás se elige en la web; todo se puede cambiar después con ⚙.")
     return cfg
+
+
+def login_link():
+    """Enlace con el token después de '#': el navegador no lo manda al servidor ni queda en registros."""
+    return f"http://{HOST}:{PORT}/#t={TOKEN}"
 
 
 TOKEN_TEMPORAL = secrets.token_urlsafe(24)   # solo si no hay token configurado
@@ -831,6 +837,9 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
 const $ = id => document.getElementById(id);
 const ls = {get:(k,d='')=>localStorage.getItem(k)??d, set:(k,v)=>localStorage.setItem(k,v)};
 let token = ls.get('oc_token'), dir = ls.get('oc_dir'), sid = null;
+{ const m = location.hash.match(/(?:^#|&)t=([^&]+)/);
+  if (m) { token = decodeURIComponent(m[1]); ls.set('oc_token', token); history.replaceState(null, '', location.pathname); } }
+const loginLink = () => `${location.origin}/#t=${encodeURIComponent(token)}`;
 let models = [], model = ls.get('oc_model'), onlyFree = ls.get('oc_free','1')==='1';
 let busy = false, sentAt = 0, seenBusy = false, timer = null, lastSig = '';
 const openIds = new Set();
@@ -847,7 +856,8 @@ async function api(path, {method='GET', body, params={}} = {}) {
     body: body ? JSON.stringify(body) : undefined
   });
   if (res.status === 401) {
-    const t = prompt('Token de acceso:');
+    const t = prompt('Hace falta el token de acceso.\n\nLo más fácil: abrí el enlace que muestra la terminal al arrancar '
+      + '(o corré  python3 opencode_chat.py --token). También podés pegar el token acá:');
     if (!t) throw new Error('Sin token');
     token = t; ls.set('oc_token', t);
     return api(path, {method, body, params});
@@ -1539,6 +1549,9 @@ async function openSettings() {
   check('ntfy_detail', 'Incluir en el aviso el comando o la ruta del permiso');
   field('upload_max_mb', 'Máximo por subida (MB)', '', 'number');
   field('download_max_mb', 'Máximo por descarga (MB)', '', 'number');
+  box.append(mk('label', '', '📱 Entrar desde otro dispositivo'));
+  const lk = mk('div', 'pr'); lk.append(copyBtn(loginLink, 'Copiar enlace de acceso'));
+  box.append(lk, mk('div', 'h', 'Mandátelo (por ejemplo por WhatsApp a vos mismo) y abrilo en el celular: entra sin pedir el token. Tratalo como una contraseña.'));
   const nt = mk('label', 'ck'), ntc = mk('input'); ntc.type = 'checkbox';
   nt.append(ntc, 'Generar un token de acceso nuevo (los otros dispositivos lo van a pedir)'); box.append(nt);
   const close = mk('button', 'btn g', 'Cerrar'); close.onclick = closeModal;
@@ -1556,7 +1569,7 @@ async function openSettings() {
       const r = await api('/api/config', {method: 'PATCH', body});
       if (r.new_token) { token = r.new_token; ls.set('oc_token', token); }
       const restart = r.restart_fields.some(k => String(r[k]) !== String(r.running[k]));
-      info.textContent = '✓ Guardado.' + (r.new_token ? ' Token nuevo: ' + r.new_token + ' (anotalo para los otros dispositivos).' : '')
+      info.textContent = '✓ Guardado.' + (r.new_token ? ' Token nuevo listo: para los otros dispositivos usá "Copiar enlace de acceso".' : '')
         + (restart ? ' La dirección o el puerto cambian al reiniciar el servidor.' : '');
     } catch (e) { info.textContent = '❌ ' + e.message; }
     save.disabled = false;
@@ -1608,6 +1621,9 @@ if __name__ == "__main__":
     if "--setup" in sys.argv:
         setup_wizard()
         sys.exit(0)
+    if "--token" in sys.argv:
+        print(f"🔑 Token: {TOKEN}\n👉 Enlace que ya entra: {login_link()}")
+        sys.exit(0)
     if not CONF_FILE.exists() and not os.environ.get("OPENCODE_CHAT_TOKEN"):
         auto_config()
         CONFIG = {**read_config(), **env_overrides()}
@@ -1615,12 +1631,9 @@ if __name__ == "__main__":
     ensure_opencode()
     print(f"🚀 OpenCode Chat {VERSION} en http://{HOST}:{PORT}")
     print(f"📂 Carpeta raíz: {ROOT}")
-    if CONFIG["token"] and not CONFIG["bienvenida"]:
-        print(f"🔑 Token: {TOKEN}   (lo pide la web la primera vez; después se cambia desde ⚙)")
-    elif CONFIG["token"]:
-        print(f"🔑 Token: el de {CONF_FILE}")
-    else:
-        print(f"🔑 Token (temporal, cambia en cada arranque): {TOKEN}")
+    print(f"👉 Abrí este enlace (ya entra solo, sin pedir el token):\n   {login_link()}")
+    if not CONFIG["token"]:
+        print("   (token temporal: cambia en cada arranque; guardá uno con --setup)")
     start_watcher()
     print("🔔 Avisos ntfy activados" if NTFY_URL else "🔕 Avisos ntfy apagados (se prenden desde ⚙)")
     try:

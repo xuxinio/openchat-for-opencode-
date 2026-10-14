@@ -83,12 +83,13 @@ Si ya tenés un `opencode serve` corriendo, lo usa; si no, lo levanta. Vas a ver
    Dirección 100.x.y.z (Tailscale) · puerto 8080 · carpeta /home/tu-usuario/projects
 ✅ opencode serve iniciado en 127.0.0.1:4096
 🚀 OpenCode Chat 6.0 en http://100.x.y.z:8080
-🔑 Token: aB3dE...   (lo pide la web la primera vez; después se cambia desde ⚙)
+👉 Abrí este enlace (ya entra solo, sin pedir el token):
+   http://100.x.y.z:8080/#t=aB3dE...
 ```
 
 ### 2.4. Primera entrada
 
-Abrí la dirección en el navegador y pegá el token. Aparece una **pantalla de bienvenida** para confirmar la carpeta de tus proyectos y, si querés, los avisos al celular (ver [sección 5](#5-avisos-en-el-celular-ntfy)). Tocá **Listo** y elegí el proyecto.
+Abrí **el enlace que muestra la terminal**: trae el token adentro, así que entra directo y el navegador lo recuerda. Si lo perdiste: `python3 opencode_chat.py --token` lo vuelve a mostrar. Aparece una **pantalla de bienvenida** para confirmar la carpeta de tus proyectos y, si querés, los avisos al celular (ver [sección 5](#5-avisos-en-el-celular-ntfy)). Tocá **Listo** y elegí el proyecto.
 
 Para pararlo: `Ctrl+C` en la terminal.
 
@@ -107,7 +108,7 @@ La forma segura de entrar desde el celular o desde otra compu es [Tailscale](htt
 1. Instalá Tailscale en la compu donde corre OpenCode Chat y en el celular, y entrá con la misma cuenta en los dos.
 2. En la compu, mirá su IP de Tailscale: `tailscale ip -4` (empieza con `100.`).
 3. Si instalaste Tailscale antes del primer arranque, OpenCode Chat ya usa esa IP. Si no, cambiala en **⚙ → Dirección** y reiniciá (o corré `python3 opencode_chat.py --setup`).
-4. En el celular, con Tailscale prendido, abrí `http://100.x.y.z:8080/`.
+4. En la compu, **⚙ → Copiar enlace de acceso** y mandátelo al celular (por WhatsApp a vos mismo, por ejemplo). Abrilo con Tailscale prendido: entra solo, sin pedir el token.
 5. Opcional: en el menú del navegador, **"Agregar a la pantalla de inicio"**, así queda como una app.
 
 ## 4. Cómo se usa
@@ -187,7 +188,8 @@ Desde la web, con el botón **⚙**:
 | Dirección y puerto | Dónde escucha | Al reiniciar |
 | Avisos por ntfy | URL del tema, token, segundos mínimos, detalle | En el momento |
 | Máximos de subida y descarga | En MB | En el momento |
-| Generar un token nuevo | Cambia la clave de acceso; los otros dispositivos la van a pedir de nuevo | En el momento |
+| Copiar enlace de acceso | El enlace que entra sin pedir el token, para abrir en otro dispositivo | — |
+| Generar un token nuevo | Cambia la clave de acceso; los otros dispositivos la van a pedir de nuevo (pasales el enlace nuevo) | En el momento |
 
 También se puede volver a correr `python3 opencode_chat.py --setup` o editar a mano `~/.config/opencode-chat/config.json` y reiniciar.
 
@@ -241,7 +243,7 @@ tmux new -d -s opencode-chat 'python3 ~/opencode-chat/opencode_chat.py'
 
 ## 8. Seguridad: leelo antes de usarlo
 
-- **El token es una llave a tu máquina.** OpenCode edita archivos y ejecuta comandos: quien tenga el token puede pedirle cualquier cosa dentro de la carpeta raíz. Tratalo como una contraseña y cambialo (⚙) si lo compartiste por error.
+- **El token es una llave a tu máquina.** OpenCode edita archivos y ejecuta comandos: quien tenga el token (o el enlace de acceso, que lo trae adentro) puede pedirle cualquier cosa dentro de la carpeta raíz. Tratalo como una contraseña y cambialo (⚙) si lo compartiste por error.
 - **No lo expongas a internet.** Usalo en `127.0.0.1` o dentro de una red privada como Tailscale. No abras el puerto en el router. Va por `http`; dentro de Tailscale el tráfico ya viaja cifrado.
 - **Elegí bien la carpeta raíz.** La web no muestra ni deja bajar archivos ni carpetas ocultos (`.env`, `.git`, `.ssh`, `.config`…) ni claves `.pem`/`.key`, pero **sí todo lo demás que esté adentro**: respaldos de bases de datos, planillas, documentos. Si tenés algo así en tus proyectos, guardalo en otro lado.
 - La web solo reenvía a OpenCode una lista cerrada de pedidos; no es un acceso libre a su API.
@@ -272,7 +274,7 @@ OpenCode y tus charlas no se borran: son de OpenCode.
 
 | Qué pasa | Qué hacer |
 |---|---|
-| La web pide el token todo el tiempo | Pegaste un token viejo. Mirá el actual en `~/.config/opencode-chat/config.json` (campo `token`). |
+| La web pide el token | Abrí el enlace que muestra `python3 opencode_chat.py --token`: entra solo. |
 | `❌ Ya hay un opencode serve corriendo… y pide contraseña` | En Linux la toma sola; en otros sistemas, o si lo levantó otro usuario, no puede. Paralo (`pkill -f 'opencode serve'`) o pasale la contraseña con `OPENCODE_SERVER_PASSWORD`. |
 | `❌ No puedo escuchar en …` | El puerto está ocupado (seguramente otra copia prendida): parala, o elegí otro con `--setup`. |
 | `❌ No encuentro el binario opencode` | OpenCode no está instalado o no está en el PATH. Probá `opencode --version`. |
