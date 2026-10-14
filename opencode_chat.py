@@ -92,13 +92,21 @@ def apply_config(cfg):
     MAX_DOWNLOAD = cfg["download_max_mb"] * 1_000_000
 
 
+def ntfy_normal(v):
+    """"mi-tema" → "https://ntfy.sh/mi-tema"; una URL completa queda igual."""
+    v = (v or "").strip()
+    if v and not v.startswith(("http://", "https://")) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v):
+        return "https://ntfy.sh/" + v
+    return v
+
+
 def validate(cfg):
     if not Path(cfg["root"]).expanduser().is_dir():
         raise ValueError("La carpeta raíz no existe")
     if not 1 <= cfg["port"] <= 65535:
         raise ValueError("Puerto inválido")
     if cfg["ntfy_url"] and not re.match(r"^https?://[^/\s]+/.+", cfg["ntfy_url"]):
-        raise ValueError("La URL de ntfy tiene que ser del tipo https://ntfy.sh/tu-tema")
+        raise ValueError("Poné el nombre del tema (ej. mi-tema-secreto) o una URL tipo https://ntfy.sh/mi-tema-secreto")
     if cfg["token"] and len(cfg["token"]) < 16:
         raise ValueError("El token tiene que tener al menos 16 caracteres")
     for k in ("ntfy_min_secs", "upload_max_mb", "download_max_mb"):
@@ -139,10 +147,18 @@ def setup_wizard():
     if not cfg["token"] or input("¿Generar un token nuevo? [n]: ").strip().lower() in ("s", "si", "sí", "y"):
         cfg["token"] = secrets.token_urlsafe(24)
         print(f"🔑 Token: {cfg['token']}   (guardalo: lo pide la web la primera vez)")
-    print("Avisos por ntfy (opcional): una URL tipo https://ntfy.sh/un-tema-largo-y-secreto. Vacío = sin avisos.")
-    v = input(f"URL de ntfy [{cfg['ntfy_url'] or 'sin avisos'}]: ").strip()
-    if v:
-        cfg["ntfy_url"] = "" if v == "-" else v
+    print("Avisos por ntfy (opcional): el nombre del tema (ej. mi-tema-largo-y-secreto) o la URL completa.")
+    print("   Enter = dejarlo como está, '-' = sin avisos.")
+    while True:
+        v = input(f"Tema o URL de ntfy [{cfg['ntfy_url'] or 'sin avisos'}]: ").strip()
+        if not v:
+            break
+        cfg["ntfy_url"] = "" if v == "-" else ntfy_normal(v)
+        try:
+            validate(cfg)
+            break
+        except ValueError as e:
+            print(f"   ✗ {e}")
     validate(cfg)
     save_config(cfg)
     print(f"\n✅ Guardado en {CONF_FILE}. Arrancá con: python3 {Path(sys.argv[0]).name}")
@@ -220,7 +236,11 @@ def ensure_opencode():
         print(f"✅ opencode serve ya está corriendo en {OC_HOST}:{OC_PORT}")
         return
     if st == 401:
-        sys.exit("❌ opencode serve pide contraseña: exportá OPENCODE_SERVER_PASSWORD.")
+        sys.exit(f"❌ Ya hay un `opencode serve` corriendo en {OC_HOST}:{OC_PORT} y pide contraseña\n"
+                 "   (suele ser el que levantó otra copia de OpenCode Chat). Dos opciones:\n"
+                 "   • Pararlo y volver a arrancar este:   pkill -f 'opencode serve'\n"
+                 "   • Usar ese, pasándole su contraseña:  OPENCODE_SERVER_PASSWORD=la-clave python3 "
+                 + Path(sys.argv[0]).name)
     exe = shutil.which("opencode")
     if not exe:
         sys.exit("❌ No encuentro el binario `opencode` en el PATH.")
@@ -535,6 +555,7 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in data.items():
             if k in DEFAULTS and k != "token" and not (k == "ntfy_token" and v == ""):
                 cfg[k] = _typed(k, v)
+        cfg["ntfy_url"] = ntfy_normal(cfg["ntfy_url"])
         nuevo = None
         if data.get("new_token"):
             nuevo = cfg["token"] = secrets.token_urlsafe(24)
@@ -1429,7 +1450,7 @@ async function openSettings() {
   field('root', 'Carpeta raíz', 'OpenCode y la web solo ven lo que está adentro.');
   field('host', 'Dirección', `127.0.0.1 = solo esta máquina. Ahora escucha en ${c.running.host}. Se aplica al reiniciar.`);
   field('port', 'Puerto', `Ahora: ${c.running.port}. Se aplica al reiniciar.`, 'number');
-  field('ntfy_url', 'Avisos por ntfy', 'Ej: https://ntfy.sh/un-tema-largo-y-secreto. Vacío = sin avisos.');
+  field('ntfy_url', 'Avisos por ntfy', 'El nombre del tema (ej. mi-tema-largo-y-secreto) o la URL completa. Vacío = sin avisos.');
   field('ntfy_token', 'Token de ntfy (si tu servidor lo pide)', c.has_ntfy_token ? 'Hay uno guardado: dejalo vacío para no cambiarlo.' : '');
   f.ntfy_token.value = '';
   field('ntfy_min_secs', 'Avisar solo si la tarea duró al menos (segundos)', '', 'number');
