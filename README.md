@@ -63,40 +63,42 @@ git clone https://github.com/xuxinio/openchat-for-opencode-.git opencode-chat
 cd opencode-chat
 ```
 
-### 2.3. Configurarlo
-
-```bash
-python3 opencode_chat.py --setup
-```
-
-El asistente pregunta cinco cosas (Enter deja el valor entre corchetes):
-
-| Pregunta | Qué poner |
-|---|---|
-| **Dirección** | `127.0.0.1` si lo vas a usar solo en esta compu. Si querés entrar desde el celular, la IP de Tailscale (el asistente la detecta y la propone). |
-| **Puerto** | `8080` está bien, salvo que ya lo use otra cosa. |
-| **Carpeta raíz** | La carpeta donde tenés tus proyectos, por ejemplo `/home/tu-usuario/proyectos`. **No pongas todo tu usuario**: ver [Seguridad](#8-seguridad-leelo-antes-de-usarlo). |
-| **Token** | Se genera solo. **Anotalo**: es la clave que te pide la web la primera vez. |
-| **ntfy** | Opcional. Dejalo vacío por ahora; se puede configurar después (ver [sección 5](#5-avisos-en-el-celular-ntfy)). |
-
-Todo queda guardado en `~/.config/opencode-chat/config.json`.
-
-### 2.4. Arrancarlo
+### 2.3. Arrancarlo
 
 ```bash
 python3 opencode_chat.py
 ```
 
-Vas a ver algo así:
+La primera vez **se configura solo**, sin preguntar nada:
+
+- **Dirección:** tu IP de Tailscale si lo tenés instalado (para entrar desde el celular); si no, `127.0.0.1` (solo esta compu).
+- **Puerto:** el 8080, o el siguiente libre.
+- **Carpeta raíz:** `~/projects`, `~/proyectos`, `~/code`… la primera que exista; si no hay ninguna, tu usuario.
+- **Token:** uno nuevo, que aparece en la terminal.
+
+Si ya tenés un `opencode serve` corriendo, lo usa; si no, lo levanta. Vas a ver algo así:
 
 ```
+✨ Primera vez: configuración automática guardada en /home/tu-usuario/.config/opencode-chat/config.json
+   Dirección 100.x.y.z (Tailscale) · puerto 8080 · carpeta /home/tu-usuario/projects
 ✅ opencode serve iniciado en 127.0.0.1:4096
-🚀 OpenCode Chat 6.0 en http://127.0.0.1:8080
-📂 Carpeta raíz: /home/tu-usuario/proyectos
-🔑 Token: el de /home/tu-usuario/.config/opencode-chat/config.json
+🚀 OpenCode Chat 6.0 en http://100.x.y.z:8080
+🔑 Token: aB3dE...   (lo pide la web la primera vez; después se cambia desde ⚙)
 ```
 
-Abrí la dirección en el navegador, pegá el token cuando lo pida y listo. Para pararlo: `Ctrl+C`.
+### 2.4. Primera entrada
+
+Abrí la dirección en el navegador y pegá el token. Aparece una **pantalla de bienvenida** para confirmar la carpeta de tus proyectos y, si querés, los avisos al celular (ver [sección 5](#5-avisos-en-el-celular-ntfy)). Tocá **Listo** y elegí el proyecto.
+
+Para pararlo: `Ctrl+C` en la terminal.
+
+### 2.5. Si preferís configurarlo a mano
+
+```bash
+python3 opencode_chat.py --setup
+```
+
+Pregunta dirección, puerto, carpeta raíz, token y ntfy (Enter deja el valor entre corchetes). Todo queda guardado en `~/.config/opencode-chat/config.json`.
 
 ## 3. Usarlo desde el celular (Tailscale)
 
@@ -104,7 +106,7 @@ La forma segura de entrar desde el celular o desde otra compu es [Tailscale](htt
 
 1. Instalá Tailscale en la compu donde corre OpenCode Chat y en el celular, y entrá con la misma cuenta en los dos.
 2. En la compu, mirá su IP de Tailscale: `tailscale ip -4` (empieza con `100.`).
-3. Volvé a correr `python3 opencode_chat.py --setup` y poné esa IP como **Dirección** (o cambiala desde ⚙ y reiniciá).
+3. Si instalaste Tailscale antes del primer arranque, OpenCode Chat ya usa esa IP. Si no, cambiala en **⚙ → Dirección** y reiniciá (o corré `python3 opencode_chat.py --setup`).
 4. En el celular, con Tailscale prendido, abrí `http://100.x.y.z:8080/`.
 5. Opcional: en el menú del navegador, **"Agregar a la pantalla de inicio"**, así queda como una app.
 
@@ -167,7 +169,7 @@ Cada bloque de código y cada respuesta tienen su botón **Copiar**. El **📋**
 1. Instalá la app **ntfy** en el celular (Android o iPhone).
 2. Inventá un tema largo y difícil de adivinar, por ejemplo `opencode-ana-7f3k9q2m`: cualquiera que lo sepa puede leer los avisos.
 3. En la app, **Suscribirse** a ese tema.
-4. En OpenCode Chat, **⚙ → Avisos por ntfy**: `https://ntfy.sh/opencode-ana-7f3k9q2m` → **Guardar**. Se activa en el momento.
+4. En OpenCode Chat, **⚙ → Avisos por ntfy** (o en la bienvenida): escribí el nombre del tema, `opencode-ana-7f3k9q2m` (o la URL completa si usás otro servidor) → **Guardar**. Se activa en el momento.
 
 Opciones:
 
@@ -271,10 +273,10 @@ OpenCode y tus charlas no se borran: son de OpenCode.
 | Qué pasa | Qué hacer |
 |---|---|
 | La web pide el token todo el tiempo | Pegaste un token viejo. Mirá el actual en `~/.config/opencode-chat/config.json` (campo `token`). |
-| `❌ opencode serve pide contraseña` | Ya tenés un `opencode serve` corriendo con contraseña. Paralo, o exportá `OPENCODE_SERVER_PASSWORD` con esa contraseña. |
+| `❌ Ya hay un opencode serve corriendo… y pide contraseña` | En Linux la toma sola; en otros sistemas, o si lo levantó otro usuario, no puede. Paralo (`pkill -f 'opencode serve'`) o pasale la contraseña con `OPENCODE_SERVER_PASSWORD`. |
+| `❌ No puedo escuchar en …` | El puerto está ocupado (seguramente otra copia prendida): parala, o elegí otro con `--setup`. |
 | `❌ No encuentro el binario opencode` | OpenCode no está instalado o no está en el PATH. Probá `opencode --version`. |
 | No aparecen modelos | No hay proveedores configurados en OpenCode: `opencode auth login`. |
-| `Address already in use` | El puerto lo usa otra cosa: elegí otro con `--setup`. |
 | Desde el celular no abre | Tailscale prendido en los dos, y la **Dirección** tiene que ser la IP de Tailscale (no `127.0.0.1`). |
 | "Fuera de la carpeta raíz permitida" | El proyecto está fuera de la carpeta raíz: ampliala en ⚙. |
 | El contexto dice "límite desconocido" | El modelo de esa charla ya no está en la lista (los gratuitos rotan) y nunca se vio su límite. El resto funciona igual. |

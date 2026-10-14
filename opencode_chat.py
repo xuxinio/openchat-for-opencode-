@@ -25,6 +25,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -39,7 +40,7 @@ CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / 
 CONF_FILE = CONF_DIR / "config.json"
 DEFAULTS = {"host": "127.0.0.1", "port": 8080, "root": str(Path.home()), "token": "",
             "ntfy_url": "", "ntfy_token": "", "ntfy_min_secs": 15, "ntfy_detail": False,
-            "ntfy_click": "", "upload_max_mb": 25, "download_max_mb": 100}
+            "ntfy_click": "", "upload_max_mb": 25, "download_max_mb": 100, "bienvenida": True}
 ENV = {"host": "HOST", "port": "PORT", "root": "OC_ROOT", "token": "OPENCODE_CHAT_TOKEN",
        "ntfy_url": "NTFY_URL", "ntfy_token": "NTFY_TOKEN", "ntfy_min_secs": "NTFY_MIN_SECS",
        "ntfy_detail": "NTFY_DETAIL", "ntfy_click": "NTFY_CLICK",
@@ -50,7 +51,7 @@ RESTART_FIELDS = ("host", "port")     # se aplican al reiniciar; el resto, en el
 def _typed(key, value):
     d = DEFAULTS[key]
     if isinstance(d, bool):
-        return value in (True, 1, "1", "true", "True", "si", "sí")
+        return value in (True, 1, "1", "true", "True", "si", "sí", "yes")
     if isinstance(d, int):
         return int(value)
     return str(value).strip()
@@ -160,8 +161,36 @@ def setup_wizard():
         except ValueError as e:
             print(f"   ✗ {e}")
     validate(cfg)
+    cfg["bienvenida"] = True
     save_config(cfg)
     print(f"\n✅ Guardado en {CONF_FILE}. Arrancá con: python3 {Path(sys.argv[0]).name}")
+
+
+def port_free(host, port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def auto_config():
+    """Primer arranque sin preguntas: detecta lo razonable, lo guarda y la web da la bienvenida."""
+    cfg = read_config()
+    cfg["host"] = tailscale_ip() or "127.0.0.1"
+    cfg["port"] = next((p for p in range(8080, 8100) if port_free(cfg["host"], p)), 8080)
+    home = Path.home()
+    cfg["root"] = str(next((home / n for n in ("projects", "proyectos", "Projects", "code", "dev", "src")
+                            if (home / n).is_dir()), home))
+    cfg["token"] = secrets.token_urlsafe(24)
+    cfg["bienvenida"] = False
+    save_config(cfg)
+    print(f"✨ Primera vez: configuración automática guardada en {CONF_FILE}")
+    print(f"   Dirección {cfg['host']}" + (" (Tailscale)" if cfg["host"] != "127.0.0.1" else " (solo esta máquina)")
+          + f" · puerto {cfg['port']} · carpeta {cfg['root']}")
+    print("   Lo demás se elige en la web; todo se puede cambiar después con ⚙.")
+    return cfg
 
 
 TOKEN_TEMPORAL = secrets.token_urlsafe(24)   # solo si no hay token configurado
@@ -229,12 +258,35 @@ def oc_status():
         return None
 
 
+def running_opencode_passwords():
+    """Contraseñas de los `opencode serve` de este usuario (Linux: /proc/<pid>/environ)."""
+    out = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            cmd = (proc / "cmdline").read_bytes().split(b"\0")
+            if not any(c.endswith(b"opencode") for c in cmd) or b"serve" not in cmd:
+                continue
+            for var in (proc / "environ").read_bytes().split(b"\0"):
+                if var.startswith(b"OPENCODE_SERVER_PASSWORD="):
+                    out.append(var.split(b"=", 1)[1].decode())
+        except OSError:
+            continue
+    return out
+
+
 def ensure_opencode():
     global OC_PASS
     st = oc_status()
     if st == 200:
         print(f"✅ opencode serve ya está corriendo en {OC_HOST}:{OC_PORT}")
         return
+    if st == 401 and not OC_PASS:
+        for clave in running_opencode_passwords():
+            OC_PASS = clave
+            if oc_status() == 200:
+                print(f"✅ Uso el opencode serve que ya estaba corriendo en {OC_HOST}:{OC_PORT}")
+                return
+        OC_PASS = ""
     if st == 401:
         sys.exit(f"❌ Ya hay un `opencode serve` corriendo en {OC_HOST}:{OC_PORT} y pide contraseña\n"
                  "   (suele ser el que levantó otra copia de OpenCode Chat). Dos opciones:\n"
@@ -1427,6 +1479,36 @@ function pick(path) {
   last ? openSession(last) : newChat();
 }
 
+/* ---------- bienvenida (primer arranque) ---------- */
+async function openWelcome(c) {
+  const sheet = $('sheet'); sheet.replaceChildren();
+  const box = mk('div', 'cfg'), info = mk('div', 'crumb'), foot = mk('div', 'foot');
+  sheet.append(mk('h3', '', '👋 ¡Bienvenido a OpenCode Chat!'), box, info, foot);
+  box.append(mk('p', '', 'Ya quedó funcionando con lo que se detectó solo. Revisá dos cosas y listo; después todo se cambia con ⚙.'));
+  box.append(mk('label', '', '📂 Carpeta de tus proyectos'));
+  const root = mk('input'); root.type = 'text'; root.value = c.root; box.append(root);
+  box.append(mk('div', 'h', 'OpenCode y esta web solo ven lo que está adentro. Mejor la de tus proyectos que todo tu usuario.'));
+  box.append(mk('label', '', '🔔 Avisos en el celular (opcional)'));
+  const nt = mk('input'); nt.type = 'text'; nt.placeholder = 'nombre de un tema de ntfy, ej. mis-avisos-x7k2q9'; nt.value = c.ntfy_url || ''; box.append(nt);
+  box.append(mk('div', 'h', 'Instalá la app ntfy, suscribite a un tema largo y difícil de adivinar y escribilo acá. Vacío = sin avisos.'));
+  box.append(mk('div', 'h', `📱 Para entrar desde el celular: http://${c.running.host}:${c.running.port}/ ` +
+    (c.running.host.startsWith('100.') ? '(con Tailscale prendido en el celular).' : '(ahora solo funciona en esta máquina; con Tailscale se puede desde el celular).')));
+  const later = mk('button', 'btn g', 'Más tarde'); later.onclick = closeModal;
+  const ok = mk('button', 'btn', 'Listo');
+  ok.onclick = async () => {
+    ok.disabled = true;
+    try {
+      await api('/api/config', {method: 'PATCH', body: {root: root.value.trim(), ntfy_url: nt.value.trim(), bienvenida: true}});
+      if (dir && !(dir === root.value.trim() || dir.startsWith(root.value.trim().replace(/\/$/, '') + '/'))) {
+        dir = ''; localStorage.removeItem('oc_dir'); $('projBtn').textContent = '📁 Elegir proyecto';
+      }
+      closeModal(); if (!dir) openProjects();
+    } catch (e) { info.textContent = '❌ ' + e.message; ok.disabled = false; }
+  };
+  foot.append(later, ok);
+  $('modal').classList.add('open');
+}
+
 /* ---------- configuración ---------- */
 async function openSettings() {
   const sheet = $('sheet'); sheet.replaceChildren();
@@ -1512,6 +1594,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden && si
   if (dir) $('projBtn').textContent = '📁 ' + base(dir);
   render([]); updateSend();
   try { await loadModels(); } catch (e) { toast('❌ ' + e.message); }
+  try { const c = await api('/api/config'); if (!c.bienvenida) return openWelcome(c); } catch {}
   if (!dir) return openProjects();
   const last = ls.get(sidKey());
   last ? openSession(last) : loadSessions();
@@ -1522,22 +1605,30 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden && si
 """
 
 if __name__ == "__main__":
-    if "--setup" in sys.argv or (not CONF_FILE.exists() and not os.environ.get("OPENCODE_CHAT_TOKEN") and sys.stdin.isatty()):
+    if "--setup" in sys.argv:
         setup_wizard()
-        if "--setup" in sys.argv:
-            sys.exit(0)
+        sys.exit(0)
+    if not CONF_FILE.exists() and not os.environ.get("OPENCODE_CHAT_TOKEN"):
+        auto_config()
         CONFIG = {**read_config(), **env_overrides()}
         apply_config(CONFIG)
     ensure_opencode()
     print(f"🚀 OpenCode Chat {VERSION} en http://{HOST}:{PORT}")
     print(f"📂 Carpeta raíz: {ROOT}")
-    if CONFIG["token"]:
+    if CONFIG["token"] and not CONFIG["bienvenida"]:
+        print(f"🔑 Token: {TOKEN}   (lo pide la web la primera vez; después se cambia desde ⚙)")
+    elif CONFIG["token"]:
         print(f"🔑 Token: el de {CONF_FILE}")
     else:
         print(f"🔑 Token (temporal, cambia en cada arranque): {TOKEN}")
     start_watcher()
     print("🔔 Avisos ntfy activados" if NTFY_URL else "🔕 Avisos ntfy apagados (se prenden desde ⚙)")
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as e:
+        sys.exit(f"❌ No puedo escuchar en {HOST}:{PORT} ({e.strerror}).\n"
+                 "   Si el puerto está ocupado, seguramente quedó prendida otra copia: pará esa,\n"
+                 f"   o elegí otro puerto con: python3 {Path(sys.argv[0]).name} --setup")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
