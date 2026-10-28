@@ -22,9 +22,11 @@ import http.client
 import json
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -40,12 +42,52 @@ CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / 
 CONF_FILE = CONF_DIR / "config.json"
 DEFAULTS = {"host": "127.0.0.1", "port": 8080, "root": str(Path.home()), "token": "",
             "ntfy_url": "", "ntfy_token": "", "ntfy_min_secs": 15, "ntfy_detail": False,
-            "ntfy_click": "", "upload_max_mb": 25, "download_max_mb": 100, "bienvenida": True}
+            "ntfy_click": "", "upload_max_mb": 25, "download_max_mb": 100, "bienvenida": True,
+            "queue_resume_at": "00:05", "queue_fallback_models": ""}
 ENV = {"host": "HOST", "port": "PORT", "root": "OC_ROOT", "token": "OPENCODE_CHAT_TOKEN",
        "ntfy_url": "NTFY_URL", "ntfy_token": "NTFY_TOKEN", "ntfy_min_secs": "NTFY_MIN_SECS",
        "ntfy_detail": "NTFY_DETAIL", "ntfy_click": "NTFY_CLICK",
        "upload_max_mb": "UPLOAD_MAX_MB", "download_max_mb": "DOWNLOAD_MAX_MB"}
 RESTART_FIELDS = ("host", "port")     # se aplican al reiniciar; el resto, en el momento
+
+# Credenciales de los proveedores de OpenCode (lo mismo que escribe /connect).
+OC_DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "opencode"
+OC_AUTH_FILE = OC_DATA_DIR / "auth.json"
+DEEPSEEK_PREFIX = "sk-"
+
+
+def oc_auth_read():
+    try:
+        data = json.loads(OC_AUTH_FILE.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def oc_auth_write(data):
+    OC_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = OC_AUTH_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    tmp.replace(OC_AUTH_FILE)
+
+
+def deepseek_key():
+    ent = oc_auth_read().get("deepseek")
+    return ent.get("key", "") if isinstance(ent, dict) else ""
+
+
+def deepseek_hint(key):
+    return "…" + key[-4:] if len(key) >= 4 else ("…" if key else "")
+
+
+def deepseek_save(key):
+    data = oc_auth_read()
+    if key:
+        data["deepseek"] = {"type": "api", "key": key}
+    else:
+        data.pop("deepseek", None)
+    oc_auth_write(data)
 
 
 def _typed(key, value):
@@ -108,6 +150,11 @@ def validate(cfg):
         raise ValueError("Puerto inválido")
     if cfg["ntfy_url"] and not re.match(r"^https?://[^/\s]+/.+", cfg["ntfy_url"]):
         raise ValueError("Poné el nombre del tema (ej. mi-tema-secreto) o una URL tipo https://ntfy.sh/mi-tema-secreto")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(cfg["queue_resume_at"])):
+        raise ValueError("La hora de la cola tiene que ser HH:MM en UTC, por ejemplo 00:05")
+    fb = [k.strip() for k in str(cfg["queue_fallback_models"]).split(",") if k.strip()]
+    if len(fb) > 5 or any("/" not in k or " " in k for k in fb):
+        raise ValueError("Los modelos de respaldo van como proveedor/modelo, separados por coma (máximo 5)")
     if cfg["token"] and len(cfg["token"]) < 16:
         raise ValueError("El token tiene que tener al menos 16 caracteres")
     for k in ("ntfy_min_secs", "upload_max_mb", "download_max_mb"):
@@ -213,7 +260,22 @@ NTFY_URL = NTFY_TOKEN = NTFY_CLICK = ""
 NTFY_MIN_SECS, NTFY_DETAIL, MAX_UPLOAD, MAX_DOWNLOAD = 15, False, 0, 0
 apply_config(CONFIG)
 WATCHER_ON = False
-WATCH_DIRS = set()   # carpetas que la UI está usando (las vigila el aviso ntfy)
+WATCH_DIRS = set()   # carpetas que se vigilan para el aviso ntfy (se guardan: valen aunque reinicie)
+WATCH_FILE = CONF_DIR / "watch_dirs.json"
+try:
+    WATCH_DIRS.update(d for d in json.loads(WATCH_FILE.read_text()) if isinstance(d, str) and os.path.isdir(d))
+except Exception:
+    pass
+
+
+def watch_add(d):
+    if d not in WATCH_DIRS:
+        WATCH_DIRS.add(d)
+        try:
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            WATCH_FILE.write_text(json.dumps(sorted(WATCH_DIRS)))
+        except Exception:
+            pass
 SEARCH_DEPTH = 4
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "dist", "build"}
 
@@ -221,12 +283,13 @@ SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "dist", "build"}
 ID = r"[A-Za-z0-9_\-]+"
 ALLOWED = [
     ("GET", r"provider"),
+    ("GET", r"config"),
     ("GET", r"session"),
     ("POST", r"session"),
     ("GET", r"session/status"),
     ("GET|PATCH|DELETE", rf"session/{ID}"),
     ("GET", rf"session/{ID}/(message|diff|todo)"),
-    ("POST", rf"session/{ID}/(prompt_async|abort)"),
+    ("POST", rf"session/{ID}/(prompt_async|abort|summarize)"),
     # permisos: ruta clásica y ruta v2 (OpenCode 1.18 tiene las dos)
     ("GET", r"permission"),
     ("POST", rf"permission/{ID}/reply"),
@@ -422,6 +485,351 @@ def watcher():
                 ntfy_send("OpenCode te pregunta", text, 4, ["question"])
 
 
+# ------------------------------------------------------------------- cola
+# Cola de consultas que corre en el servidor (sigue aunque se cierre el navegador).
+# Si el proveedor corta por cupo, se pausa hasta la hora configurada (UTC) y retoma sola.
+QUEUE_FILE = CONF_DIR / "queue.json"
+QLOCK = threading.RLock()
+QUEUE_THREAD = None
+QUEUE_RE = re.compile(r"rate.?limit|quota|cuota|429|too many requests|insufficient|credit|exceeded|limit reached|free tier|usage limit", re.I)
+QUEUE_CONTINUE = ("Seguí con la tarea anterior desde donde quedó. Se cortó por el límite de uso del "
+                  "proveedor, no por un error tuyo. Revisá qué ya está hecho antes de repetir nada.")
+QUEUE_ACTIVE = ("pending", "waiting", "running")
+
+
+def queue_load():
+    try:
+        q = json.loads(QUEUE_FILE.read_text())
+        if not isinstance(q, dict):
+            q = {}
+    except Exception:
+        q = {}
+    q.setdefault("items", [])
+    q.setdefault("paused", False)
+    q.setdefault("wait_until", 0)
+    q.setdefault("wait_reason", "")
+    return q
+
+
+def queue_save(q):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = QUEUE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(q, indent=1, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, QUEUE_FILE)
+
+
+def queue_next_resume():
+    """Próxima vez (epoch) que llega la hora configurada, en UTC."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        h, m = map(int, str(read_config().get("queue_resume_at") or "00:05").split(":"))
+    except Exception:
+        h, m = 0, 5
+    now = datetime.now(timezone.utc)
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t <= now + timedelta(seconds=60):
+        t += timedelta(days=1)
+    return t.timestamp()
+
+
+def queue_qs(d):
+    return "?" + urllib.parse.urlencode({"directory": d})
+
+
+def queue_abort(item):
+    if item.get("sid"):
+        try:
+            oc_request("POST", f"/session/{item['sid']}/abort" + queue_qs(item["dir"]), None, timeout=10)
+        except Exception:
+            pass
+
+
+def queue_model_key(model):
+    return f"{model['providerID']}/{model['modelID']}"
+
+
+def queue_fallbacks():
+    out = []
+    for k in str(read_config().get("queue_fallback_models") or "").split(","):
+        k = k.strip()
+        if "/" in k and k not in out:
+            out.append(k)
+    return out[:5]
+
+
+def queue_pick_model(q, item):
+    """El modelo elegido y después los de respaldo: el primero que no se haya quedado sin cupo."""
+    gone = set(q.get("exhausted", []))
+    for k in [queue_model_key(item["model"])] + queue_fallbacks():
+        if k not in gone:
+            return k
+    return None
+
+
+def queue_defer(q, item, reason):
+    """Sin cupo en este modelo: prueba con el siguiente de respaldo; si no queda ninguno,
+    la cola espera a la hora fijada."""
+    queue_abort(item)
+    cur = item.get("using") or queue_model_key(item["model"])
+    q.setdefault("exhausted", [])
+    if cur not in q["exhausted"]:
+        q["exhausted"].append(cur)
+    item["status"] = "waiting"
+    item["error"] = ""
+    nxt = queue_pick_model(q, item)
+    threading.Thread(target=ntfy_send, daemon=True, args=(
+        "OpenCode: sin cupo", ("Sigo con " + nxt.split("/")[-1]) if nxt else "Espero a la hora fijada", 3, ["hourglass"])).start()
+    if nxt:
+        item["using"] = nxt
+        q["wait_reason"] = ""
+    else:
+        q["wait_until"] = queue_next_resume()
+        q["wait_reason"] = str(reason or "")[:200]
+
+
+def queue_start(q, item):
+    d = item["dir"]
+    qs = queue_qs(d)
+    watch_add(d)
+    k = item.get("using")
+    if not k or k in q.get("exhausted", []):
+        k = queue_pick_model(q, item)
+    if not k:
+        q["wait_until"] = queue_next_resume()
+        q["wait_reason"] = "Todos los modelos configurados están sin cupo"
+        return True
+    item["using"] = k
+    try:
+        if not item.get("sid"):
+            st, _, data = oc_request("POST", "/session" + qs, b"{}", timeout=20)
+            if st >= 300:
+                raise RuntimeError(f"No pude crear la sesión (HTTP {st})")
+            item["sid"] = json.loads(data)["id"]
+            text = item["text"]
+        else:
+            text = QUEUE_CONTINUE
+        p_, _, m_ = k.partition("/")
+        body = json.dumps({"model": {"providerID": p_, "modelID": m_}, "parts": [{"type": "text", "text": text}]}).encode()
+        st, _, data = oc_request("POST", f"/session/{item['sid']}/prompt_async" + qs, body, timeout=20)
+        if st >= 300:
+            msg = data.decode("utf-8", "replace")[:200]
+            if QUEUE_RE.search(msg):
+                queue_defer(q, item, msg)
+                return True
+            raise RuntimeError(f"HTTP {st}: {msg}")
+    except Exception as e:
+        item["status"] = "error"
+        item["error"] = str(e)[:200]
+        return True
+    item["status"] = "running"
+    item["started"] = time.time()
+    item["seen_busy"] = False
+    item["tries"] = item.get("tries", 0) + 1
+    item["error"] = ""
+    return True
+
+
+def queue_check_running(q, item):
+    """Devuelve True si cambió algo que haya que guardar."""
+    sid, qs = item["sid"], queue_qs(item["dir"])
+    st = oc_json("/session/status" + qs)
+    if not isinstance(st, dict):
+        return False
+    s = st.get(sid)
+    typ = s.get("type") if isinstance(s, dict) else "idle"
+    if typ == "retry":
+        msg = str(s.get("message") or "")
+        if QUEUE_RE.search(msg) or int(s.get("attempt") or 0) >= 4:
+            queue_defer(q, item, msg or "El proveedor pidió esperar (reintentos agotados)")
+            return True
+        return False
+    if typ != "idle":
+        if not item.get("seen_busy"):
+            item["seen_busy"] = True
+            return True
+        return False
+    if not item.get("seen_busy") and time.time() - item.get("started", 0) < 15:
+        return False   # todavía no arrancó
+    msgs = oc_json(f"/session/{sid}/message" + qs)
+    last = None
+    for m in reversed(msgs if isinstance(msgs, list) else []):
+        if isinstance(m, dict) and (m.get("info") or {}).get("role") == "assistant":
+            last = m["info"]
+            break
+    if last is None:
+        item["status"] = "error"
+        item["error"] = "Sin respuesta del modelo"
+        return True
+    err = last.get("error")
+    if err:
+        text = str((err.get("data") or {}).get("message") or err.get("message") or err.get("name") or "")
+        if QUEUE_RE.search(text + " " + str(err.get("name") or "")) and not re.search(r"context|contexto", text, re.I):
+            queue_defer(q, item, text)
+        else:
+            item["status"] = "error"
+            item["error"] = text[:200]
+        return True
+    item["status"] = "done"
+    item["finished"] = time.time()
+    return True
+
+
+def queue_tick():
+    with QLOCK:
+        q = queue_load()
+        if q["paused"]:
+            return
+        dirty = False
+        if q["wait_until"]:
+            if time.time() < q["wait_until"]:
+                return
+            q["wait_until"], q["wait_reason"], dirty = 0, "", True
+            q["exhausted"] = []
+            for it in q["items"]:
+                if it["status"] == "waiting":
+                    it["using"] = None
+        run = next((i for i in q["items"] if i["status"] == "running"), None)
+        if run:
+            dirty = queue_check_running(q, run) or dirty
+        else:
+            nxt = next((i for i in q["items"] if i["status"] in ("waiting", "pending")), None)
+            if nxt:
+                dirty = queue_start(q, nxt) or dirty
+        if dirty:
+            queue_save(q)
+
+
+def queue_worker():
+    while True:
+        time.sleep(3)
+        try:
+            queue_tick()
+        except Exception as e:
+            print(f"⚠️  cola: {e}")
+
+
+def start_queue_worker():
+    global QUEUE_THREAD
+    if QUEUE_THREAD is None:
+        QUEUE_THREAD = threading.Thread(target=queue_worker, daemon=True)
+        QUEUE_THREAD.start()
+
+
+def queue_view():
+    with QLOCK:
+        q = queue_load()
+        keys = ("id", "dir", "text", "label", "status", "error", "model", "tries", "using")
+        return {"items": [{k: i.get(k) for k in keys} for i in q["items"]],
+                "paused": q["paused"], "wait_until": q["wait_until"], "wait_reason": q["wait_reason"],
+                "resume_at": read_config().get("queue_resume_at") or "00:05", "now": time.time(),
+                "fallbacks": queue_fallbacks(), "exhausted": q.get("exhausted", [])}
+
+
+def queue_add(d, model, text, label=""):
+    queue_add_many(d, model, [{"text": text, "label": label}])
+
+
+def queue_add_many(d, model, items):
+    """Agrega varias tareas sueltas (cada una independiente de las demás), en el orden dado."""
+    d = str(safe_path(d))
+    if not (isinstance(model, dict) and model.get("providerID") and model.get("modelID")):
+        raise ValueError("Falta el modelo")
+    if not isinstance(items, list) or not items:
+        raise ValueError("No hay tareas para agregar")
+    clean = []
+    for it in items:
+        text = str((it or {}).get("text") or "").strip()
+        if not text:
+            raise ValueError("Falta el texto")
+        if len(text) > 50_000:
+            raise ValueError("El texto es demasiado largo")
+        clean.append((text, str((it or {}).get("label") or "").strip()[:300]))
+    with QLOCK:
+        q = queue_load()
+        if sum(1 for i in q["items"] if i["status"] in QUEUE_ACTIVE) + len(clean) > 100:
+            raise ValueError("La cola está llena (100 tareas)")
+        for text, label in clean:
+            q["items"].append({"id": secrets.token_hex(6), "dir": d, "text": text, "label": label,
+                               "model": {"providerID": str(model["providerID"]), "modelID": str(model["modelID"])},
+                               "status": "pending", "sid": None, "added": time.time()})
+        queue_save(q)
+
+
+def find_bitacora(base):
+    """Busca la bitácora en la carpeta (o en docs/): cualquier .md cuyo nombre diga bitácora."""
+    import unicodedata
+    def norm(n):
+        return unicodedata.normalize("NFD", n).encode("ascii", "ignore").decode().lower()
+    cands = []
+    for sub in (base, base / "docs", base / "doc"):
+        if sub.is_dir():
+            cands += [f for f in sorted(sub.iterdir())
+                      if f.is_file() and f.suffix.lower() == ".md" and "bitacora" in norm(f.name)]
+    return cands[0] if cands else None
+
+
+def queue_bitacora_items(d):
+    """Ítems pendientes (- [ ]) de la bitácora del proyecto, con la sección en que están."""
+    base = safe_path(d)
+    f = find_bitacora(base)
+    if not f or f.stat().st_size > 2_000_000:
+        return {"file": None, "items": []}
+    lines = f.read_text(errors="replace").splitlines()
+    out, section, i = [], "", 0
+    while i < len(lines) and len(out) < 200:
+        ln = lines[i]
+        h = re.match(r"^#{2,4}\s+(.*)", ln)
+        if h:
+            section = h.group(1).strip()[:100]
+        m = re.match(r"^(\s*)[-*]\s+\[ \]\s+(.*)", ln)
+        if m:
+            ind, text, j = len(m.group(1)), m.group(2).strip(), i + 1
+            while (j < len(lines) and lines[j].strip() and not re.match(r"^\s*([-*]\s|#)", lines[j])
+                   and len(lines[j]) - len(lines[j].lstrip()) > ind):
+                text += " " + lines[j].strip()
+                j += 1
+            out.append({"id": str(i + 1), "section": section, "title": text[:300], "line": i + 1})
+            i = j
+            continue
+        i += 1
+    return {"file": str(f.relative_to(base)), "items": out}
+
+
+def queue_action(action, payload):
+    with QLOCK:
+        q = queue_load()
+        if action == "pause":
+            q["paused"] = bool(payload.get("paused"))
+        elif action == "now":
+            q["wait_until"], q["wait_reason"], q["paused"] = 0, "", False
+            q["exhausted"] = []
+            for it in q["items"]:
+                if it["status"] == "waiting":
+                    it["using"] = None
+        elif action == "remove":
+            it = next((i for i in q["items"] if i["id"] == payload.get("id")), None)
+            if it and it["status"] == "running":
+                queue_abort(it)
+            q["items"] = [i for i in q["items"] if i["id"] != payload.get("id")]
+        elif action == "move":
+            items = q["items"]
+            idx = next((n for n, i in enumerate(items) if i["id"] == payload.get("id")), None)
+            if idx is not None:
+                it = items.pop(idx)
+                how = payload.get("how")
+                if how == "top":
+                    first = next((n for n, i in enumerate(items) if i["status"] in ("pending", "waiting")), 0)
+                    items.insert(first, it)
+                else:
+                    items.insert(max(0, min(len(items), idx + (-1 if how == "up" else 1))), it)
+        elif action == "clear":
+            q["items"] = [i for i in q["items"] if i["status"] in QUEUE_ACTIVE]
+        else:
+            raise ValueError("Acción desconocida")
+        queue_save(q)
+
+
 # ------------------------------------------------------------- filesystem
 def safe_path(p):
     path = Path(p or ROOT).expanduser().resolve()
@@ -517,6 +925,81 @@ def clean_name(n):
     return n[:150]
 
 
+# -------------------------------------------------------------- procesos
+def _ps_uid_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def list_processes():
+    try:
+        data = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,uid=,pcpu=,pmem=,rss=,etime=,args="],
+            capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    me = os.getuid()
+    out = []
+    for line in data.stdout.splitlines():
+        f = line.split(None, 7)
+        if len(f) < 8:
+            continue
+        try:
+            pid, ppid, uid = int(f[0]), int(f[1]), int(f[2])
+            cpu, mem, rss = float(f[3]), float(f[4]), int(f[5])
+        except ValueError:
+            continue
+        out.append({"pid": pid, "ppid": ppid, "uid": uid,
+                    "user": _ps_uid_name(uid), "mine": uid == me,
+                    "cpu": cpu, "mem": mem, "rss": rss,
+                    "etime": f[6], "cmd": f[7]})
+    out.sort(key=lambda p: (-p["cpu"], p["pid"]))
+    return out
+
+
+def _pid_alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return True
+    rp = stat.rfind(")")
+    if rp < 0 or rp + 2 >= len(stat):
+        return True
+    return stat[rp + 2] != "Z"   # Z = zombie: ya está muerto, espera ser recogido
+
+
+def kill_process(pid):
+    if pid is None:
+        raise ValueError("Falta el PID")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        raise ValueError("PID inválido")
+    if pid in (0, 1, os.getpid()):
+        raise PermissionError("No se puede detener ese proceso")
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except (FileNotFoundError, ProcessLookupError):
+        raise ValueError("Proceso no encontrado")
+    if uid != os.getuid():
+        raise PermissionError("Solo podés detener tus propios procesos")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(8):
+        time.sleep(0.5)
+        if not _pid_alive(pid):
+            return {"pid": pid, "signal": "SIGTERM"}
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return {"pid": pid, "signal": "SIGKILL"}
+
+
 # ------------------------------------------------------------------ server
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -572,10 +1055,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload(qs)
             if u.path == "/api/download" and method == "GET":
                 return self._download(qs)
+            if u.path == "/api/processes" and method == "GET":
+                return self._json(200, {"processes": list_processes()})
+            if u.path == "/api/processes/kill" and method == "POST":
+                raw = self._read_body()
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    raise ValueError("JSON inválido")
+                return self._json(200, kill_process(payload.get("pid")))
             if u.path == "/api/config" and method == "GET":
                 return self._json(200, self._config_view())
             if u.path == "/api/config" and method == "PATCH":
                 return self._config_save()
+            if u.path == "/api/deepseek" and method == "GET":
+                return self._json(200, self._deepseek_view())
+            if u.path == "/api/deepseek" and method == "PATCH":
+                return self._deepseek_save()
+            if u.path == "/api/queue" or u.path.startswith("/api/queue/"):
+                return self._queue_route(method, u.path, qs)
             if u.path.startswith("/api/oc/"):
                 return self._proxy(method, u, qs)
             self._json(404, {"error": "No encontrado"})
@@ -586,6 +1084,28 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(502, {"error": f"{type(e).__name__}: {e}"})
 
+    def _queue_route(self, method, path, qs):
+        raw = self._read_body() if method == "POST" else b""
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            raise ValueError("JSON inválido")
+        if path == "/api/queue" and method == "GET":
+            return self._json(200, queue_view())
+        if path == "/api/queue" and method == "POST":
+            queue_add(payload.get("dir"), payload.get("model"), payload.get("text"))
+            return self._json(200, queue_view())
+        if path == "/api/queue/pending" and method == "GET":
+            return self._json(200, queue_bitacora_items(qs.get("dir", [""])[0]))
+        if path == "/api/queue/bulk" and method == "POST":
+            queue_add_many(payload.get("dir"), payload.get("model"), payload.get("items"))
+            return self._json(200, queue_view())
+        m = re.fullmatch(r"/api/queue/(pause|now|remove|clear|move)", path)
+        if m and method == "POST":
+            queue_action(m.group(1), payload)
+            return self._json(200, queue_view())
+        return self._json(404, {"error": "No encontrado"})
+
     def _proxy(self, method, u, qs):
         sub = u.path[len("/api/oc/"):].strip("/")
         if not any(m.fullmatch(method) and p.fullmatch(sub) for m, p in ALLOWED):
@@ -593,7 +1113,7 @@ class Handler(BaseHTTPRequestHandler):
         out = {k: qs[k][0] for k in FORWARD_QS if k in qs}
         if "directory" in out:
             out["directory"] = str(safe_path(out["directory"]))
-            WATCH_DIRS.add(out["directory"])
+            watch_add(out["directory"])
         body = self._read_body() if method in ("POST", "PATCH") else None
         path = "/" + sub + ("?" + urllib.parse.urlencode(out) if out else "")
         status, ctype, data = oc_request(method, path, body or None)
@@ -603,6 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
         cfg = read_config()
         envs = sorted(k for k in env_overrides())
         return {**{k: v for k, v in cfg.items() if k not in ("token", "ntfy_token")},
+                "token": TOKEN, "token_fixed": "token" in envs,
                 "has_ntfy_token": bool(cfg["ntfy_token"]), "file": str(CONF_FILE),
                 "env_locked": envs, "restart_fields": list(RESTART_FIELDS),
                 "running": {"host": HOST, "port": PORT}, "version": VERSION, **extra}
@@ -622,6 +1143,23 @@ class Handler(BaseHTTPRequestHandler):
         apply_config({**cfg, **env_overrides(), "host": HOST, "port": PORT})
         start_watcher()
         return self._json(200, self._config_view(new_token=nuevo))
+
+    def _deepseek_view(self, **extra):
+        key = deepseek_key()
+        return {"on": bool(key), "hint": deepseek_hint(key),
+                "file": str(OC_AUTH_FILE), **extra}
+
+    def _deepseek_save(self):
+        data = json.loads(self._read_body() or b"{}")
+        if "key" not in data:
+            raise ValueError("Falta la clave")
+        key = str(data.get("key") or "").strip()
+        if len(key) > 200:
+            raise ValueError("La clave es demasiado larga")
+        if key and not key.startswith(DEEPSEEK_PREFIX):
+            raise ValueError("Una clave de DeepSeek empieza con sk-")
+        deepseek_save(key)
+        return self._json(200, self._deepseek_view())
 
     def _upload(self, qs):
         folder = safe_path(qs.get("dir", [""])[0])
@@ -762,6 +1300,11 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
 .item .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item .m{color:var(--muted);font-size:12px}
 .pick{border:1px solid var(--accent);color:var(--accent);border-radius:8px;padding:2px 10px;font-size:12px}
+.kill{background:var(--danger);color:#fff;border-radius:8px;padding:3px 12px;font-size:12px;flex-shrink:0}
+.kill:disabled{opacity:.4;cursor:default}
+.pname{flex:1;min-width:0;text-align:left}
+.pname b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;font-size:14px}
+.pname .m{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .foot{display:flex;gap:8px;padding:10px 16px;padding-bottom:max(10px,env(safe-area-inset-bottom));border-top:1px solid var(--line);align-items:center}
 .btn{padding:8px 14px;border-radius:10px;background:var(--accent);color:#fff}
 .btn.g{background:var(--card);color:var(--text)}
@@ -774,6 +1317,10 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
 .bar i{display:block;height:100%;background:var(--accent)}
 .bar i.w{background:#e5a23b}.bar i.d{background:var(--danger)}
 .tkf{margin-top:2px;font-size:11px;color:var(--muted)}
+.meter .acc{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+.meter .acc button{border:1px solid var(--line);border-radius:8px;padding:2px 10px;font-size:11px;color:var(--muted);background:var(--card)}
+.meter .acc button:hover{color:var(--text);border-color:var(--accent)}
+.meter .acc button:disabled{opacity:.5}
 .pw{position:relative}
 .pw>pre{padding-top:32px}
 .cp{position:absolute;top:6px;right:6px;padding:2px 8px;font-size:12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--muted)}
@@ -793,10 +1340,12 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
 .warn button{border:1px solid #e5a23b;border-radius:8px;padding:2px 10px}
 .cfg{overflow-y:auto;padding:4px 16px 8px;flex:1}
 .cfg label{display:block;font-size:13px;color:var(--muted);margin:10px 0 3px}
-.cfg input[type=text],.cfg input[type=number]{width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;outline:0}
+.cfg input[type=text],.cfg input[type=number],.cfg input[type=password]{width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;outline:0}
 .cfg input:disabled{opacity:.5}
 .cfg .h{font-size:11px;color:var(--muted);margin-top:3px}
 .cfg .ck{display:flex;gap:8px;align-items:center;color:var(--text)}
+.cfg .tok{display:flex;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.cfg .tok code{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .perm input[type=text]{width:100%;margin-top:6px;padding:8px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;outline:0}
 </style>
 </head>
@@ -814,6 +1363,8 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
       <button class="chip" id="projBtn">📁 Elegir proyecto</button>
       <span style="flex:1"></span>
       <button class="chip" id="filesBtn" title="Archivos: subir y descargar">📎</button>
+      <button class="chip" id="procsBtn" title="Procesos del servidor">🖥️</button>
+      <button class="chip" id="qBtn" title="Cola de tareas">⏳</button>
       <button class="chip" id="cpAll" title="Copiar toda la conversación">📋</button>
       <button class="chip" id="cfgBtn" title="Configuración">⚙</button>
     </header>
@@ -823,7 +1374,7 @@ textarea{width:100%;background:none;border:0;outline:0;color:var(--text);font:in
       <div class="box">
         <textarea id="input" rows="1" placeholder="Escribile a OpenCode…"></textarea>
         <div class="row">
-          <button class="chip" id="modelBtn">⚡ Modelo</button>
+          <div style="display:flex;gap:6px;min-width:0"><button class="chip" id="modelBtn">⚡ Modelo</button><button class="chip" id="qAddBtn" title="Agregar este mensaje a la cola de tareas en lugar de enviarlo ahora">＋ Cola</button></div>
           <button id="send" title="Enviar">↑</button>
         </div>
       </div>
@@ -841,9 +1392,10 @@ let token = ls.get('oc_token'), dir = ls.get('oc_dir'), sid = null;
   if (m) { token = decodeURIComponent(m[1]); ls.set('oc_token', token); history.replaceState(null, '', location.pathname); } }
 const loginLink = () => `${location.origin}/#t=${encodeURIComponent(token)}`;
 let models = [], model = ls.get('oc_model'), onlyFree = ls.get('oc_free','1')==='1';
-let busy = false, sentAt = 0, seenBusy = false, timer = null, lastSig = '';
-const openIds = new Set();
-let perms = [], questions = [], lastMsgs = [];
+const KEY_PROVIDERS = ['deepseek'];   // se muestran sin conexión para pedir la clave al elegirlos
+const HIDDEN_MODELS = new Set(['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-vision-exp']);   // los lista el proveedor pero no existen y fallan en silencio
+let busy = false, sentAt = 0, seenBusy = false, timer = null, lastSig = '', sendTimedOut = false, retryMsg = '', retryAttempt = 0, retryNext = 0;
+const openIds = new Set();let perms = [], questions = [], lastMsgs = [];
 const sidKey = () => 'oc_sid:' + dir;   // última charla de cada proyecto
 const rememberSid = () => { if (dir) { sid ? ls.set(sidKey(), sid) : localStorage.removeItem(sidKey()); } };
 
@@ -941,16 +1493,27 @@ function updateMeter(msgs) {
     const bar = mk('div', 'bar'), i = mk('i', pct > 85 ? 'd' : pct > 60 ? 'w' : '');
     i.style.width = pct + '%'; bar.append(i); el.append(bar);
   }
+  const acc = mk('div', 'acc');
+  const bc = mk('button', '', compacting ? '🗜 Compactando…' : '🗜 Compactar');
+  bc.title = 'El modelo resume la charla; desde ahí cada mensaje manda el resumen y no todo el historial';
+  bc.disabled = busy || compacting; bc.onclick = compactar;
+  const bn = mk('button', '', '↪ Seguir en nueva');
+  bn.title = 'Abre una charla nueva en este proyecto con el resumen de esta, listo para revisar y enviar';
+  bn.disabled = busy || compacting; bn.onclick = seguirEnNueva;
+  acc.append(bc, bn); el.append(acc);
   const lastErr = [...msgs].reverse().find(x => x.info.role === 'assistant')?.info.error;
   if (isQuota(lastErr)) {
     const w = mk('div', 'warn');
     w.append(mk('span', '', '⛽ El proveedor cortó por cupo o límite de uso de este modelo. Elegí otro modelo o esperá.'));
     const b = mk('button', '', 'Cambiar modelo'); b.onclick = openModels; w.append(b);
     el.append(w);
-  } else if (lim && pct >= 75) {
+  } else if ((lim && pct >= 50) || used >= PESADA) {
+    // Cada mensaje reenvía todo el contexto: aunque falte para el límite, una charla pesada gasta el cupo rápido.
     const w = mk('div', 'warn');
-    w.append(mk('span', '', `⚠ Quedan ${ft(Math.max(0, lim - used))} de contexto: conviene seguir en una charla nueva antes de que se llene.`));
-    const b = mk('button', '', 'Nueva charla'); b.onclick = newChat; w.append(b);
+    w.append(mk('span', '', `⚠ Esta charla pesa ${ft(used)}: cada mensaje reenvía todo eso y gasta el cupo rápido. Compactala o seguí en una nueva.`));
+    const b1 = mk('button', '', 'Compactar'); b1.onclick = compactar; b1.disabled = busy || compacting;
+    const b2 = mk('button', '', 'Seguir en nueva'); b2.onclick = seguirEnNueva; b2.disabled = busy || compacting;
+    w.append(b1, b2);
     el.append(w);
   }
 }
@@ -987,6 +1550,13 @@ function renderMsg(m) {
   return wrap.children.length ? [wrap] : [];
 }
 
+function retrySecs() {
+  if (!retryNext) return 0;
+  const t = retryNext < 1e12 ? retryNext * 1000 : retryNext;   // por si viene en segundos
+  return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+}
+function fmtSecs(n) { return n >= 60 ? Math.floor(n / 60) + ' min ' + (n % 60) + ' s' : n + ' s'; }
+
 function render(msgs) {
   lastMsgs = msgs;
   updateMeter(msgs);
@@ -1002,6 +1572,11 @@ function render(msgs) {
   msgs.forEach(m => els.push(...renderMsg(m)));
   perms.forEach(p => els.push(permCard(p)));
   questions.forEach(x => els.push(questionCard(x)));
+  if (retryMsg) {
+    const secs = retrySecs();
+    const det = (retryAttempt ? ' · intento ' + retryAttempt : '') + (retryNext ? ' · próximo reintento en ' + fmtSecs(secs) : '');
+    els.push(mk('div', 'err', '❌ ' + retryMsg + det + ' (tocá ■ para frenar y elegí otro modelo)'));
+  }
   if (busy) { const d = mk('div', 'dots'); d.innerHTML = '<span>●</span><span>●</span><span>●</span>'; els.push(d); }
   col.replaceChildren(...els);
   if (near) chat.scrollTop = chat.scrollHeight;
@@ -1220,6 +1795,65 @@ function openFiles(start = '') {
   go(cur);
 }
 
+/* ---------- procesos del servidor ---------- */
+let procPoll = null;
+function procRow(p) {
+  const r = mk('div', 'item');
+  const left = mk('div', 'pname');
+  left.append(mk('b', '', p.cmd));
+  left.append(mk('div', 'm', `${p.user} · PID ${p.pid}${p.ppid > 1 ? ' · PPID ' + p.ppid : ''} · CPU ${p.cpu.toFixed(1)}% · MEM ${p.mem.toFixed(1)}% · ${fsz(p.rss * 1024)} · ${p.etime}`));
+  r.append(left);
+  if (p.mine) {
+    const k = mk('button', 'kill', 'Detener');
+    k.onclick = () => killProc(p, k);
+    r.append(k);
+  } else {
+    r.append(mk('span', 'm', p.user === 'root' ? 'sistema' : ''));
+  }
+  return r;
+}
+async function killProc(p, btn) {
+  if (!confirm(`¿Detener el proceso ${p.pid}?\n\n${p.cmd.slice(0, 120)}\n\nPrimero SIGTERM; si no termina, SIGKILL.`)) return;
+  btn.disabled = true; btn.textContent = 'Deteniendo…';
+  try {
+    const r = await api('/api/processes/kill', {method: 'POST', body: {pid: p.pid}});
+    btn.textContent = '✓ ' + r.signal;
+    setTimeout(openProcesses, 600);
+  } catch (e) {
+    const info = $('sheet').querySelector('.crumb');
+    if (info) info.textContent = '❌ ' + e.message;
+    btn.disabled = false; btn.textContent = 'Detener';
+  }
+}
+function openProcesses() {
+  const sheet = $('sheet'); sheet.replaceChildren();
+  const info = mk('div', 'crumb');
+  const list = mk('div', 'list');
+  const foot = mk('div', 'foot');
+  const close = mk('button', 'btn g', 'Cerrar'); close.onclick = closeModal;
+  const refresh = mk('button', 'btn', '↻ Actualizar');
+  foot.append(close, refresh);
+  sheet.append(mk('h3', '', 'Procesos del servidor'), info, list, foot);
+  $('modal').classList.add('open');
+  async function load() {
+    refresh.disabled = true;
+    try {
+      const d = await api('/api/processes');
+      const ps = d.processes || [];
+      const mine = ps.filter(p => p.mine).length;
+      info.textContent = `${ps.length} procesos · ${mine} tuyos · ${new Date().toLocaleTimeString()}`;
+      list.replaceChildren();
+      ps.forEach(p => list.append(procRow(p)));
+      if (!ps.length) list.append(mk('div', 'crumb', 'Sin procesos.'));
+    } catch (e) { list.textContent = '❌ ' + e.message; }
+    refresh.disabled = false;
+  }
+  refresh.onclick = load;
+  load();
+  if (procPoll) clearInterval(procPoll);
+  procPoll = setInterval(load, 4000);
+}
+
 /* ---------- polling ---------- */
 async function tick() {
   clearTimeout(timer);
@@ -1229,10 +1863,26 @@ async function tick() {
     perms = pr; questions = qn;
     const s = st && st[sid];
     const serverBusy = !!s && s.type !== 'idle';
+    const retrying = !!s && s.type === 'retry';
     if (serverBusy) seenBusy = true;
-    busy = serverBusy || (sentAt && !seenBusy && Date.now() - sentAt < 4000);
-    if (!busy) { sentAt = 0; seenBusy = false; }
-    const sig = JSON.stringify(msgs) + busy + JSON.stringify(perms) + JSON.stringify(questions);
+    if (retrying) {
+      retryMsg = (s.message || s.action?.message || 'El proveedor gratuito agotó el cupo. Usá otro modelo (⚡) o esperá al reinicio de medianoche, o subscribite.').slice(0, 220);
+      retryAttempt = Number(s.attempt) || 0;
+      retryNext = Number(s.next) || 0;
+      sendTimedOut = true;
+    }
+    const timedOut = !serverBusy && sentAt && !seenBusy && Date.now() - sentAt > 6000;
+    busy = serverBusy || (!timedOut && sentAt && !seenBusy && Date.now() - sentAt < 6000);
+    if (!busy) {
+      if (timedOut && !sendTimedOut) {
+        sendTimedOut = true;
+        toast('❌ Sin respuesta: el modelo puede no estar disponible. Probá otro o actualizá la lista.');
+      }
+      if (!retrying) { retryMsg = ''; retryAttempt = 0; retryNext = 0; }
+      sentAt = 0; seenBusy = false;
+    }
+    if (!retrying) { retryAttempt = 0; retryNext = 0; if (!busy) retryMsg = ''; }
+    const sig = JSON.stringify(msgs) + busy + JSON.stringify(perms) + JSON.stringify(questions) + '|' + retryMsg + '|' + retryAttempt + '|' + (retryNext ? retrySecs() : 0);
     if (sig !== lastSig) { lastSig = sig; render(msgs); }
     updateSend();
   } catch (e) {
@@ -1264,10 +1914,10 @@ async function loadSessions() {
   } catch (e) { box.textContent = '❌ ' + e.message; }
 }
 function openSession(id) {
-  sid = id; rememberSid(); lastSig = ''; busy = false; perms = []; questions = []; sentAt = 0; seenBusy = false;
+  sid = id; rememberSid(); lastSig = ''; busy = false; perms = []; questions = []; sentAt = 0; seenBusy = false; retryMsg = '';
   closeSide(); tick(); loadSessions();
 }
-function newChat() { sid = null; rememberSid(); lastSig = ''; busy = false; perms = []; questions = []; closeSide(); render([]); loadSessions(); updateSend(); $('input').focus(); }
+function newChat() { sid = null; rememberSid(); lastSig = ''; busy = false; perms = []; questions = []; retryMsg = ''; closeSide(); render([]); loadSessions(); updateSend(); $('input').focus(); }
 
 /* ---------- envío ---------- */
 function updateSend() {
@@ -1284,11 +1934,74 @@ async function send() {
   $('input').value = ''; autosize();
   try {
     if (!sid) { const s = await oc('session', {method: 'POST', body: {}}); sid = s.id; rememberSid(); loadSessions(); }
-    sentAt = Date.now(); seenBusy = false; busy = true; updateSend();
+    sentAt = Date.now(); seenBusy = false; sendTimedOut = false; retryMsg = ''; busy = true; updateSend();
     await oc(`session/${sid}/prompt_async`, {method: 'POST',
       body: {model: {providerID: m.providerID, modelID: m.modelID}, parts: [{type: 'text', text}]}});
     tick();
-  } catch (e) { busy = false; sentAt = 0; updateSend(); toast('❌ ' + e.message); }
+  } catch (e) {
+    busy = false; sentAt = 0; sendTimedOut = false; updateSend(); toast('❌ ' + e.message);
+    if (/model|provider|not ?found|disponible/i.test(e.message)) toast('Puede que ese modelo ya no esté disponible. Elegí otro vos mismo en ⚡ (no lo cambio solo).');
+  }
+}
+
+/* ---------- compactar / seguir en una charla nueva ---------- */
+const PESADA = 60000;     // tokens de contexto desde los que se avisa (cada mensaje los reenvía)
+let compacting = false;
+const lastSummary = msgs => {
+  // Resumen de la última compactación, solo si después no hubo más charla
+  const i = msgs.map(x => x.info).findLastIndex(x => x.role === 'assistant' && x.summary);
+  if (i < 0 || msgs.slice(i + 1).some(x => x.info.role === 'assistant')) return '';
+  return msgs[i].parts.filter(p => p.type === 'text').map(p => p.text).join('\n').trim();
+};
+async function waitIdle(id, maxMs = 300000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    const st = await oc('session/status'); const s = st && st[id];
+    if (!s || s.type === 'idle') return true;
+    await sleep(1500);
+  }
+  return false;
+}
+async function runSummarize() {
+  const m = models.find(x => x.key === model);
+  if (!m) { openModels(); return false; }
+  compacting = true; lastSig = ''; updateMeter(lastMsgs);
+  try {
+    await oc(`session/${sid}/summarize`, {method: 'POST', body: {providerID: m.providerID, modelID: m.modelID}});
+    await waitIdle(sid);
+    return true;
+  } catch (e) {
+    toast('❌ No se pudo compactar: ' + e.message);
+    return false;
+  } finally {
+    compacting = false; lastSig = ''; tick();
+  }
+}
+async function compactar() {
+  if (!sid || compacting) return;
+  if (busy) return toast('Esperá a que termine la respuesta actual (o detenela) para compactar.');
+  const m = models.find(x => x.key === model);
+  if (!confirm(`Compactar esta charla: ${m ? m.name : 'el modelo elegido'} la resume y desde ahí cada mensaje manda solo el resumen. Usa un pedido del modelo. ¿Sigo?`)) return;
+  await runSummarize();
+}
+async function seguirEnNueva() {
+  if (!sid || compacting) return;
+  if (busy) return toast('Esperá a que termine la respuesta actual (o detenela).');
+  const viejo = sid;
+  let msgs = await oc(`session/${viejo}/message`);
+  let resumen = lastSummary(msgs);
+  if (!resumen) {
+    if (!confirm('Para seguir en una charla nueva primero se compacta esta (un pedido al modelo) y el resumen queda escrito en la nueva para que lo revises y lo envíes. ¿Sigo?')) return;
+    if (!(await runSummarize())) return;
+    msgs = await oc(`session/${viejo}/message`);
+    resumen = lastSummary(msgs);
+  }
+  if (!resumen) return toast('❌ No encontré el resumen de la charla. Probá compactar de nuevo.');
+  let titulo = '';
+  try { titulo = (await oc(`session/${viejo}`))?.title || ''; } catch {}
+  newChat();
+  $('input').value = `Seguimos un trabajo de la charla anterior${titulo ? ` («${titulo}»)` : ''}. Resumen de lo hecho hasta ahora:\n\n${resumen}\n\nContinuá desde acá. Si necesitás más detalle, leé los archivos del proyecto (bitácora, tareas) en vez de pedírmelo.`;
+  autosize(); $('input').focus();
 }
 
 /* ---------- modelos ---------- */
@@ -1297,24 +2010,34 @@ async function loadModels() {
   const connected = new Set(d.connected || []);
   models = [];
   for (const p of d.all || []) {
-    if (!connected.has(p.id)) continue;
+    const needsKey = !connected.has(p.id) && KEY_PROVIDERS.includes(p.id);
+    if (!connected.has(p.id) && !needsKey) continue;
     for (const [id, m] of Object.entries(p.models || {})) {
+      const key = p.id + '/' + id;
+      if (HIDDEN_MODELS.has(key)) continue;
       const free = !!m.cost && m.cost.input === 0 && m.cost.output === 0;
-      models.push({key: p.id + '/' + id, providerID: p.id, modelID: id, name: m.name || id, provider: p.name || p.id, free, context: m.limit?.context || 0});
+      models.push({key, providerID: p.id, modelID: id, name: m.name || id, provider: p.name || p.id, free, needsKey, pin: KEY_PROVIDERS.includes(p.id), context: m.limit?.context || 0});
     }
   }
   const lims = knownLimits();
   for (const m of models) if (m.context) lims[m.key] = m.context;
   ls.set('oc_limits', JSON.stringify(lims));
+  let preferred = '';
+  try { preferred = (await api('/api/oc/config'))?.model || ''; } catch {}
+  const def = models.find(m => m.key === preferred) || (preferred ? {key: preferred, providerID: preferred.split('/')[0], modelID: preferred.split('/').slice(1).join('/'), name: preferred.split('/').pop(), provider: preferred.split('/')[0], free: /free/i.test(preferred), context: 0} : null);
+  if (def && !models.some(m => m.key === def.key)) models.unshift(def);
+  const usable = () => models.filter(m => !m.needsKey);
+  if (preferred && !ls.get('oc_model') && usable().some(m => m.key === preferred)) model = preferred;
   if (!models.some(m => m.key === model)) {
-    const f = models.find(m => m.free) || models[0];
+    const f = (preferred && usable().find(m => m.key === preferred)) || usable().find(m => m.free) || usable()[0];
     model = f ? f.key : '';
   }
+  ls.set('oc_model', model);
   paintModel();
 }
 function paintModel() {
   const m = models.find(x => x.key === model);
-  $('modelBtn').textContent = '⚡ ' + (m ? m.name : 'Elegir modelo') + ' ▾';
+  $('modelBtn').textContent = '⚡ ' + (m ? (m.needsKey ? '🔑 ' : '') + m.name : 'Elegir modelo') + ' ▾';
 }
 /* ---------- test de velocidad ---------- */
 let speed = {}; try { speed = JSON.parse(ls.get('oc_speed', '{}')); } catch {}
@@ -1374,9 +2097,12 @@ function openModels() {
     metas = {};
     const term = q.value.toLowerCase();
     let arr = models.filter(m => (m.name + m.provider).toLowerCase().includes(term));
+    const pinned = arr.filter(m => m.pin);
+    arr = arr.filter(m => !m.pin);
     const free = arr.filter(m => m.free);
     const note = cb.checked && !free.length && arr.length;
     if (cb.checked && free.length) arr = free;
+    arr = arr.concat(pinned);
     const tested = arr.some(m => speed[m.key]);
     if (tested) arr = [...arr].sort((a, b) => rank(a) - rank(b));
     list.replaceChildren();
@@ -1386,9 +2112,12 @@ function openModels() {
     for (const m of arr) {
       if (!tested && m.provider !== last) { list.append(mk('div', 'lbl', m.provider)); last = m.provider; }
       const b = mk('button', 'item');
-      const meta = mk('span', 'm', spdLabel(m)); metas[m.key] = meta;
+      const meta = mk('span', 'm', m.needsKey ? '🔑 falta la clave' : spdLabel(m)); metas[m.key] = meta;
       b.append(mk('span', 'n', (m.key === model ? '✓ ' : '') + m.name + (tested ? ' · ' + m.provider : '')), meta);
-      b.onclick = () => { model = m.key; ls.set('oc_model', model); paintModel(); closeModal(); };
+      b.onclick = () => {
+        if (m.needsKey) { closeModal(); return openDeepseekKey(m.key); }
+        model = m.key; ls.set('oc_model', model); paintModel(); closeModal();
+      };
       list.append(b);
     }
     if (!arr.length) list.append(mk('div', 'crumb', 'Sin resultados.'));
@@ -1397,12 +2126,18 @@ function openModels() {
   cb.onchange = () => { onlyFree = cb.checked; ls.set('oc_free', onlyFree ? '1' : '0'); paint(); };
 
   const c = mk('button', 'btn g', 'Cerrar'); c.onclick = closeModal;
-  const tb = mk('button', 'btn', testRun ? '■ Detener' : '⏱ Probar');
-  tb.onclick = async () => {
+  const refreshBtn = mk('button', 'btn g', '↻ Actualizar');
+  refreshBtn.onclick = async () => {
+    refreshBtn.disabled = true; refreshBtn.textContent = '↻ Actualizando…';
+    try { await loadModels(); toast('✓ Modelos actualizados'); }
+    catch (e) { toast('❌ ' + e.message); }
+    finally { refreshBtn.textContent = '↻ Actualizar'; refreshBtn.disabled = false; if (sheet.contains(refreshBtn)) paint(); }
+  };
+  const tb = mk('button', 'btn', testRun ? '■ Detener' : '⏱ Probar');  tb.onclick = async () => {
     if (testRun) { testRun.stop = true; return; }
     const term = q.value.toLowerCase();
-    // Solo se prueban modelos gratuitos: probar uno de pago costaría plata
-    const targets = models.filter(m => m.free && (m.name + m.provider).toLowerCase().includes(term));
+    // Se prueban todos los modelos visibles en la lista filtrada
+    const targets = models.filter(m => !m.needsKey && (m.name + m.provider).toLowerCase().includes(term));
     if (!targets.length) { info.textContent = 'No detecto modelos gratuitos para probar.'; return; }
     const run = testRun = {stop: false};
     tb.textContent = '■ Detener';
@@ -1423,9 +2158,43 @@ function openModels() {
       info.textContent = stopped ? 'Prueba detenida.' : 'Listo: ordenados del más rápido al más lento.';
     }
   };
-  const foot = mk('div', 'foot'); foot.append(c, tb, sw);
-  sheet.append(mk('h3', '', 'Elegir modelo'), q, info, list, foot);
-  $('modal').classList.add('open'); paint();
+  const foot = mk('div', 'foot'); foot.append(c, tb, sw, refreshBtn);
+  sheet.append(mk('h3', '', 'Elegir modelo'), q, info, list, foot);  $('modal').classList.add('open'); paint();
+}
+
+/* ---------- clave de DeepSeek (al elegir un modelo deepseek/*) ---------- */
+async function openDeepseekKey(selectKey) {
+  const sheet = $('sheet'); sheet.replaceChildren();
+  const info = mk('div', 'crumb'), box = mk('div', 'cfg'), foot = mk('div', 'foot');
+  sheet.append(mk('h3', '', '🔑 Clave de DeepSeek'), info, box, foot);
+  $('modal').classList.add('open');
+  let ds = {};
+  try { ds = await api('/api/deepseek'); } catch {}
+  box.append(mk('p', '', 'Los modelos de DeepSeek necesitan tu API key. Se guarda solo en tu máquina, nunca en el proyecto ni en git.'));
+  box.append(mk('label', '', 'API key de DeepSeek'));
+  const keyIn = mk('input'); keyIn.type = 'password'; keyIn.autocomplete = 'off'; keyIn.placeholder = 'sk-…';
+  box.append(keyIn, mk('div', 'h', 'La sacás de platform.deepseek.com → API keys. Empieza con sk-.'));
+  if (ds.on) box.append(mk('div', 'h', 'Ya hay una guardada (' + ds.hint + '). Si escribís otra, la reemplaza.'));
+  const msg = mk('div', 'crumb');
+  box.append(msg, mk('div', 'h', 'Se guarda en ' + (ds.file || 'auth.json') + ' con permisos solo para tu usuario (nunca se versiona) y se usa al instante.'));
+  const cancel = mk('button', 'btn g', 'Cancelar'); cancel.onclick = () => { closeModal(); openModels(); };
+  const save = mk('button', 'btn', 'Guardar y usar');
+  save.onclick = async () => {
+    const k = keyIn.value.trim();
+    if (!k) { msg.textContent = 'Escribí la clave primero.'; return; }
+    save.disabled = true; msg.textContent = 'Guardando…';
+    try {
+      await api('/api/deepseek', {method: 'PATCH', body: {key: k}});
+      await loadModels();
+      if (selectKey && models.some(m => m.key === selectKey && !m.needsKey)) {
+        model = selectKey; ls.set('oc_model', model); paintModel();
+      }
+      closeModal();
+      toast('✓ Clave de DeepSeek guardada. Ya podés usar sus modelos.');
+    } catch (e) { msg.textContent = '❌ ' + e.message; save.disabled = false; }
+  };
+  foot.append(cancel, save);
+  setTimeout(() => keyIn.focus(), 50);
 }
 
 /* ---------- selector de carpetas ---------- */
@@ -1549,11 +2318,68 @@ async function openSettings() {
   check('ntfy_detail', 'Incluir en el aviso el comando o la ruta del permiso');
   field('upload_max_mb', 'Máximo por subida (MB)', '', 'number');
   field('download_max_mb', 'Máximo por descarga (MB)', '', 'number');
+  let ds = {};
+  try { ds = await api('/api/deepseek'); } catch {}
+  box.append(mk('label', '', '🧠 DeepSeek (API key)'));
+  const dsInfo = mk('div', 'h', ds.on ? 'Hay una clave guardada (' + ds.hint + ').' : 'Sin clave: los modelos deepseek/* no aparecen hasta cargarla.');
+  const dsIn = mk('input'); dsIn.type = 'password'; dsIn.autocomplete = 'off'; dsIn.placeholder = 'sk-…';
+  const dsBtns = mk('div', 'pr');
+  const dsSave = mk('button', 'btn', 'Guardar clave');
+  const dsDel = mk('button', 'btn g', 'Quitar'); dsDel.disabled = !ds.on;
+  dsBtns.append(dsSave, dsDel);
+  box.append(dsIn, dsBtns, dsInfo);
+  box.append(mk('div', 'h', 'Se guarda en ' + (ds.file || 'auth.json') + ' (el mismo sitio que /connect) y se usa al instante, sin reiniciar opencode serve.'));
+  const paintDs = (on, hint, msg) => {
+    dsDel.disabled = !on; dsIn.value = '';
+    dsInfo.textContent = msg || (on ? '✓ Clave guardada (' + hint + '). Los modelos DeepSeek ya están disponibles.' : '✓ Clave eliminada.');
+  };
+  dsSave.onclick = async () => {
+    const k = dsIn.value.trim();
+    if (!k) { dsInfo.textContent = 'Escribí la clave primero.'; return; }
+    dsSave.disabled = true;
+    try { const r = await api('/api/deepseek', {method: 'PATCH', body: {key: k}}); paintDs(r.on, r.hint); await loadModels(); }
+    catch (e) { dsInfo.textContent = '❌ ' + e.message; }
+    dsSave.disabled = false;
+  };
+  dsDel.onclick = async () => {
+    if (!confirm('¿Quitar la clave de DeepSeek?')) return;
+    dsDel.disabled = true;
+    try { const r = await api('/api/deepseek', {method: 'PATCH', body: {key: ''}}); paintDs(r.on, r.hint); await loadModels(); }
+    catch (e) { dsInfo.textContent = '❌ ' + e.message; }
+    dsDel.disabled = false;
+  };
+  box.append(mk('label', '', '🔑 Token de acceso actual'));
+  const tokWrap = mk('div', 'tok'), tokCode = mk('code', '');
+  tokWrap.append(tokCode); box.append(tokWrap);
+  const tokBtns = mk('div', 'pr');
+  const tokShow = mk('button', 'btn g', 'Mostrar');
+  tokBtns.append(tokShow, copyBtn(() => c.token, 'Copiar token'));
+  box.append(tokBtns);
+  const tokenMask = t => t ? '•'.repeat(Math.min(t.length, 24)) : '(sin token)';
+  let tokShown = false;
+  const paintTok = () => { tokCode.textContent = tokShown ? c.token : tokenMask(c.token); tokShow.textContent = tokShown ? 'Ocultar' : 'Mostrar'; };
+  tokShow.onclick = () => { tokShown = !tokShown; paintTok(); };
+  paintTok();
+  box.append(mk('div', 'h', 'Es la llave de acceso a esta máquina: tratala como una contraseña. ' + (c.token_fixed ? 'La fija una variable de entorno, no se puede cambiar desde acá.' : '')));
+  box.append(mk('label', '', '🔄 Cambiar el token'));
+  const genRow = mk('div', 'pr');
+  const genBtn = mk('button', 'btn', 'Generar un token nuevo'); genBtn.disabled = !!c.token_fixed;
+  genBtn.onclick = async () => {
+    if (!confirm('¿Generar un token nuevo? Los otros dispositivos van a tener que usar el enlace de acceso otra vez.')) return;
+    genBtn.disabled = true;
+    try {
+      const r = await api('/api/config', {method: 'PATCH', body: {new_token: true}});
+      if (r.token) { c.token = r.token; token = r.token; ls.set('oc_token', token); }
+      tokShown = true; paintTok();
+      info.textContent = '✓ Token nuevo generado y ya activo en este dispositivo. A los demás pasales el enlace de acceso.';
+    } catch (e) { info.textContent = '❌ ' + e.message; }
+    genBtn.disabled = !!c.token_fixed;
+  };
+  genRow.append(genBtn); box.append(genRow);
+  box.append(mk('div', 'h', 'Cambia la clave al instante, sin reiniciar.'));
   box.append(mk('label', '', '📱 Entrar desde otro dispositivo'));
   const lk = mk('div', 'pr'); lk.append(copyBtn(loginLink, 'Copiar enlace de acceso'));
   box.append(lk, mk('div', 'h', 'Mandátelo (por ejemplo por WhatsApp a vos mismo) y abrilo en el celular: entra sin pedir el token. Tratalo como una contraseña.'));
-  const nt = mk('label', 'ck'), ntc = mk('input'); ntc.type = 'checkbox';
-  nt.append(ntc, 'Generar un token de acceso nuevo (los otros dispositivos lo van a pedir)'); box.append(nt);
   const close = mk('button', 'btn g', 'Cerrar'); close.onclick = closeModal;
   const save = mk('button', 'btn', 'Guardar');
   save.onclick = async () => {
@@ -1563,7 +2389,6 @@ async function openSettings() {
       body[k] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? Number(i.value) : i.value.trim();
     }
     if (!body.ntfy_token) delete body.ntfy_token;
-    if (ntc.checked) body.new_token = true;
     save.disabled = true;
     try {
       const r = await api('/api/config', {method: 'PATCH', body});
@@ -1577,8 +2402,187 @@ async function openSettings() {
   foot.append(close, save);
 }
 
+/* ---------- cola de tareas ---------- */
+let qPoll = null;
+const Q_ICON = {pending: '⏳', running: '▶️', waiting: '💤', done: '✓', error: '✗'};
+const Q_TXT = {pending: 'pendiente', running: 'ejecutando', waiting: 'en espera por cupo', done: 'hecha', error: 'con error'};
+function qLeft(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? `${h} h ${m} min` : m ? `${m} min ${s % 60} s` : `${s} s`;
+}
+async function queueAddFromInput() {
+  const text = $('input').value.trim();
+  if (!text) return;
+  if (!dir) return openProjects();
+  const m = models.find(x => x.key === model);
+  if (!m) return openModels();
+  const b = $('qAddBtn');
+  try {
+    await api('/api/queue', {method: 'POST', body: {dir, model: {providerID: m.providerID, modelID: m.modelID}, text}});
+    $('input').value = ''; autosize();
+    b.textContent = '✓ En la cola';
+  } catch (e) { b.textContent = '✗ ' + e.message.slice(0, 40); }
+  setTimeout(() => { b.textContent = '＋ Cola'; }, 1800);
+}
+function openQueue() {
+  const sheet = $('sheet'); sheet.replaceChildren();
+  const info = mk('div', 'crumb'), list = mk('div', 'list'), foot = mk('div', 'foot');
+  const close = mk('button', 'btn g', 'Cerrar'); close.onclick = closeModal;
+  const pause = mk('button', 'btn g', 'Pausar');
+  const now = mk('button', 'btn g', 'Reintentar ahora');
+  const clr = mk('button', 'btn g', 'Limpiar terminadas');
+  const hrLbl = mk('label', 'sw', 'Reanuda a las (UTC)');
+  const hr = mk('input'); hr.type = 'text'; hr.size = 5;
+  hr.style.cssText = 'width:68px;padding:6px 8px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--text);font:inherit';
+  hrLbl.append(hr);
+  const fromBit = mk('button', 'btn', '＋ Desde la bitácora'); fromBit.onclick = openQueueBitacora;
+  foot.append(fromBit, close, pause, now, clr, hrLbl);
+  const fbBox = mk('div', 'crumb');
+  const fbChips = mk('div'); fbChips.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin:4px 0';
+  const fbIn = mk('select');
+  fbIn.style.cssText = 'flex:1;min-width:0;padding:6px 8px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--text);font:inherit;margin:0';
+  const fbAdd = mk('button', 'btn g', 'Agregar');
+  const fbRow = mk('div'); fbRow.style.cssText = 'display:flex;gap:6px;align-items:center'; fbRow.append(fbIn, fbAdd);
+  fbBox.append(mk('div', '', 'Si un modelo se queda sin cupo, probar con (en este orden):'), fbChips, fbRow);
+  sheet.append(mk('h3', '', 'Cola de tareas'), info, fbBox, list, foot);
+  $('modal').classList.add('open');
+  let cur = null, skew = 0;
+  const act = async (a, body = {}) => {
+    try { cur = await api('/api/queue/' + a, {method: 'POST', body}); skew = cur.now * 1000 - Date.now(); paint(); }
+    catch (e) { info.textContent = '❌ ' + e.message; }
+  };
+  pause.onclick = () => act('pause', {paused: !(cur && cur.paused)});
+  now.onclick = () => act('now');
+  clr.onclick = () => act('clear');
+  const saveFb = async arr => {
+    try { await api('/api/config', {method: 'PATCH', body: {queue_fallback_models: arr.join(',')}}); } catch (e) { info.textContent = '❌ ' + e.message; }
+    load();
+  };
+  fbAdd.onclick = () => {
+    let v = fbIn.value.trim();
+    const hit = models.find(m => m.key === v) || models.find(m => m.name.toLowerCase() === v.toLowerCase());
+    if (hit) v = hit.key;
+    if (!v || !v.includes('/') || /\s/.test(v)) { info.textContent = '❌ Elegí un modelo del desplegable.'; return; }
+    const arr = (cur && cur.fallbacks) || [];
+    if (arr.includes(v)) { fbIn.value = ''; return; }
+    if (arr.length >= 5) { info.textContent = '❌ Máximo 5 modelos de respaldo.'; return; }
+    fbIn.value = ''; saveFb([...arr, v]);
+  };
+  hr.onchange = async () => {
+    try { await api('/api/config', {method: 'PATCH', body: {queue_resume_at: hr.value.trim()}}); } catch (e) { info.textContent = '❌ ' + e.message; }
+    load();
+  };
+  let fbSig = null;
+  function fillFb(taken) {
+    const free = models.filter(x => x.free && !x.needsKey && !taken.includes(x.key))
+      .sort((a, b) => (a.provider + a.name).localeCompare(b.provider + b.name));
+    const sig = free.map(x => x.key).join('|');
+    if (sig === fbSig) return;           // no tocar el desplegable si no cambió (se cerraría abierto)
+    fbSig = sig;
+    const keep = fbIn.value;
+    fbIn.replaceChildren();
+    const o0 = mk('option', '', free.length ? '— Elegí un modelo gratuito —' : '(no hay modelos gratuitos para agregar)');
+    o0.value = ''; fbIn.append(o0);
+    for (const m of free) { const o = mk('option', '', `${m.name} · ${m.provider}`); o.value = m.key; fbIn.append(o); }
+    fbIn.value = free.some(x => x.key === keep) ? keep : '';
+  }
+  function paint() {
+    if (!cur) return;
+    fillFb(cur.fallbacks || []);
+    const q = cur, left = q.wait_until ? q.wait_until * 1000 - (Date.now() + skew) : 0;
+    const todo = q.items.filter(i => ['pending', 'waiting', 'running'].includes(i.status)).length;
+    const gone = (q.exhausted && q.exhausted.length) ? ' · sin cupo: ' + q.exhausted.join(', ') : '';
+    info.textContent = (q.paused ? `⏸ En pausa · ${todo} por hacer (lo que ya está corriendo termina)`
+      : left > 0 ? `💤 Sin cupo${q.wait_reason ? ' (' + q.wait_reason.slice(0, 100) + ')' : ''}: sigue en ${qLeft(left)}, a las ${q.resume_at} UTC · ${todo} por hacer`
+      : todo ? `▶ Trabajando · ${todo} por hacer` : 'Cola vacía.') + (q.paused || left > 0 ? '' : gone);
+    pause.textContent = q.paused ? 'Reanudar' : 'Pausar';
+    if (document.activeElement !== hr) hr.value = q.resume_at;
+    fbChips.replaceChildren();
+    for (const k of q.fallbacks || []) {
+      const m = models.find(x => x.key === k);
+      const c = mk('span', 'chip', (m ? m.name : k) + (q.exhausted && q.exhausted.includes(k) ? ' · sin cupo' : '') + ' ✕');
+      c.style.cursor = 'pointer'; c.title = 'Quitar ' + k;
+      c.onclick = () => saveFb(q.fallbacks.filter(x => x !== k));
+      fbChips.append(c);
+    }
+    if (!(q.fallbacks || []).length) fbChips.append(mk('span', 'm', 'Ninguno: si se corta por cupo, la cola espera a la hora fijada.'));
+    list.replaceChildren();
+    for (const i of q.items) {
+      const r = mk('div', 'item'), l = mk('div', 'pname');
+      l.append(mk('b', '', `${Q_ICON[i.status] || '?'} ${(i.label || i.text).replace(/\s+/g, ' ').slice(0, 90)}`));
+      l.append(mk('div', 'm', `${base(i.dir)} · ${Q_TXT[i.status] || i.status}` + (i.using && ['running', 'waiting'].includes(i.status) ? ' · modelo ' + i.using : '') + (i.error ? ' · ' + i.error : '')));
+      const x = mk('button', 'kill', i.status === 'running' ? 'Detener' : 'Quitar');
+      x.onclick = () => { if (confirm(i.status === 'running' ? '¿Detener esta tarea y sacarla de la cola?' : '¿Quitar esta tarea de la cola?')) act('remove', {id: i.id}); };
+      if (['pending', 'waiting'].includes(i.status)) {
+        const mv = mk('div'); mv.style.cssText = 'display:flex;gap:2px;flex-shrink:0';
+        for (const [sym, how, tip] of [['⏫', 'top', 'Mandar primero'], ['▲', 'up', 'Subir'], ['▼', 'down', 'Bajar']]) {
+          const b = mk('button', 'chip', sym); b.title = tip; b.style.padding = '2px 8px';
+          b.onclick = () => act('move', {id: i.id, how}); mv.append(b);
+        }
+        r.append(l, mv, x);
+      } else r.append(l, x);
+      list.append(r);
+    }
+    if (!q.items.length) list.append(mk('div', 'crumb', 'Sin tareas. Escribí un mensaje y tocá ＋ Cola para dejarlo en espera.'));
+  }
+  async function load() {
+    try { cur = await api('/api/queue'); skew = cur.now * 1000 - Date.now(); paint(); }
+    catch (e) { info.textContent = '❌ ' + e.message; }
+  }
+  load();
+  if (qPoll) clearInterval(qPoll);
+  let n = 0;
+  qPoll = setInterval(() => { n++; n % 3 === 0 ? load() : paint(); }, 1000);
+}
+
+
+const bitPrompt = it => `Tarea de la bitácora${it.section ? ' (' + it.section + ')' : ''}: ${it.title}\n\n`
+  + 'Leé las reglas del proyecto (AGENTS.md si existe) y la bitácora antes de empezar. Hacé solo esta tarea, nada más. Si ya está hecha, decímelo sin cambiar nada.';
+async function openQueueBitacora() {
+  if (!dir) return openProjects();
+  const m = models.find(x => x.key === model);
+  if (!m) return openModels();
+  const sheet = $('sheet'); sheet.replaceChildren();
+  const info = mk('div', 'crumb', 'Leyendo la bitácora…'), list = mk('div', 'list'), foot = mk('div', 'foot');
+  const back = mk('button', 'btn g', '← Volver'); back.onclick = openQueue;
+  const addSel = mk('button', 'btn', 'Agregar seleccionadas');
+  const addFree = mk('button', 'btn g', 'Agregar tarea libre');
+  const free = mk('textarea'); free.rows = 2; free.placeholder = 'Otra tarea libre (no tiene que estar en la bitácora)';
+  free.style.cssText = 'margin:6px 16px;width:calc(100% - 32px);padding:8px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;resize:none;display:block';
+  foot.append(back, addFree, addSel);
+  sheet.append(mk('h3', '', 'Agregar a la cola · ' + base(dir)), info, list, free, foot);
+  $('modal').classList.add('open');
+  const picked = [];   // en el orden en que se van tildando
+  const badges = new Map();
+  const repaint = () => { for (const [it, b] of badges) { const n = picked.indexOf(it); b.textContent = n >= 0 ? '#' + (n + 1) : ''; } };
+  const push = async items => {
+    try { await api('/api/queue/bulk', {method: 'POST', body: {dir, model: {providerID: m.providerID, modelID: m.modelID}, items}}); openQueue(); }
+    catch (e) { info.textContent = '❌ ' + e.message; }
+  };
+  addFree.onclick = () => { const t = free.value.trim(); if (t) push([{text: t, label: ''}]); };
+  addSel.onclick = () => {
+    if (!picked.length) { info.textContent = 'Marcá al menos una tarea (se agregan en el orden en que las marcás).'; return; }
+    push(picked.map(it => ({label: it.title, text: bitPrompt(it)})));
+  };
+  try {
+    const r = await api('/api/queue/pending', {params: {dir}});
+    info.textContent = r.file ? `${r.file}: ${r.items.length} pendientes. Se agregan con el modelo ${m.name}, en el orden en que las marcás.`
+                              : 'No encontré BITACORA.md en esta carpeta. Podés agregar una tarea libre abajo.';
+    let last = null;
+    for (const it of r.items) {
+      if (it.section !== last) { list.append(mk('div', 'lbl', it.section || 'Sin sección')); last = it.section; }
+      const row = mk('label', 'item'); row.style.cursor = 'pointer';
+      const cb = mk('input'); cb.type = 'checkbox';
+      const t = mk('span', 'n', it.title); t.style.whiteSpace = 'normal';
+      const b = mk('span', 'm', ''); badges.set(it, b);
+      cb.onchange = () => { const n = picked.indexOf(it); if (cb.checked && n < 0) picked.push(it); if (!cb.checked && n >= 0) picked.splice(n, 1); repaint(); };
+      row.append(cb, t, b); list.append(row);
+    }
+  } catch (e) { info.textContent = '❌ ' + e.message; }
+}
+
 /* ---------- UI varia ---------- */
-function closeModal() { if (testRun) testRun.stop = true; $('modal').classList.remove('open'); }
+function closeModal() { if (testRun) testRun.stop = true; if (procPoll) { clearInterval(procPoll); procPoll = null; } if (qPoll) { clearInterval(qPoll); qPoll = null; } $('modal').classList.remove('open'); }
 function closeSide() { $('side').classList.remove('open'); $('scrim').classList.remove('open'); }
 $('menu').onclick = () => { $('side').classList.add('open'); $('scrim').classList.add('open'); };
 $('scrim').onclick = closeSide;
@@ -1587,7 +2591,10 @@ $('newBtn').onclick = newChat;
 $('projBtn').onclick = () => openProjects();
 $('modelBtn').onclick = openModels;
 $('filesBtn').onclick = () => openFiles();
+$('procsBtn').onclick = openProcesses;
 $('cfgBtn').onclick = () => openSettings();
+$('qBtn').onclick = openQueue;
+$('qAddBtn').onclick = queueAddFromInput;
 $('cpAll').onclick = async e => {
   const b = e.currentTarget, t = chatText();
   if (!t) return;
@@ -1635,6 +2642,7 @@ if __name__ == "__main__":
     if not CONFIG["token"]:
         print("   (token temporal: cambia en cada arranque; guardá uno con --setup)")
     start_watcher()
+    start_queue_worker()
     print("🔔 Avisos ntfy activados" if NTFY_URL else "🔕 Avisos ntfy apagados (se prenden desde ⚙)")
     try:
         srv = ThreadingHTTPServer((HOST, PORT), Handler)

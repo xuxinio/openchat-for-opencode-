@@ -188,8 +188,9 @@ Desde la web, con el botón **⚙**:
 | Dirección y puerto | Dónde escucha | Al reiniciar |
 | Avisos por ntfy | URL del tema, token, segundos mínimos, detalle | En el momento |
 | Máximos de subida y descarga | En MB | En el momento |
+| Token de acceso actual | Verlo u ocultarlo y copiarlo (podés cambiar la clave desde ahí) | — |
+| Cambiar el token | Cambia la clave de acceso al instante; los otros dispositivos la van a pedir de nuevo (pasales el enlace nuevo) | En el momento |
 | Copiar enlace de acceso | El enlace que entra sin pedir el token, para abrir en otro dispositivo | — |
-| Generar un token nuevo | Cambia la clave de acceso; los otros dispositivos la van a pedir de nuevo (pasales el enlace nuevo) | En el momento |
 
 También se puede volver a correr `python3 opencode_chat.py --setup` o editar a mano `~/.config/opencode-chat/config.json` y reiniciar.
 

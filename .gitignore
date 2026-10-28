@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 *.bak
+# Claves y secretos: nunca al repositorio
+auth.json
+.env
+*.key
+*.pem
+
+# Copias de seguridad locales
+*.bak-*
